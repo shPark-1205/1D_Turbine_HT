@@ -97,7 +97,6 @@ class PassageApp(tk.Tk):
         self.geometry("1380x860")
         self.minsize(1260, 780)
         self.configure(bg=WINDOW_BG)
-        self.option_add("*Font", "Segoe UI 11")
 
         self.node_rows: list[dict[str, str]] = []
         self.edge_rows: list[dict[str, str]] = []
