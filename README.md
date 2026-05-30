@@ -15,6 +15,8 @@ The first version focuses on:
 - optional CoolProp air properties when CoolProp is installed
 - smooth, rib, U-turn, and pin-fin placeholder correlations
 - user friction multipliers and user K-loss inputs
+- optional `parallel_passages` parameter for representative edges that model
+  multiple identical passages
 
 ## Run the example
 
@@ -104,4 +106,7 @@ python -m unittest discover -s tests
 - Rib and pin-fin formulas are implemented as replaceable modules. Their
   pressure-drop models are intentionally simple until project-specific
   correlations are added.
+- When an edge represents several identical parallel passages, set
+  `parallel_passages` so local velocity and pressure loss are evaluated per
+  passage while heat-transfer area is scaled by the passage count.
 - Internal calculations are SI.

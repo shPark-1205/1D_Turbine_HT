@@ -30,6 +30,17 @@ def evaluate_edge(
 ) -> EdgeResult:
     if mass_flow <= 0.0:
         raise ValueError(f"Edge {edge.edge_id} mass flow must be positive.")
+    if inlet.pressure <= 0.0:
+        raise ValueError(
+            f"{edge.edge_id}: inlet node {edge.from_node} pressure is "
+            f"non-positive ({inlet.pressure:.1f} Pa). Upstream pressure loss "
+            "already exceeded the available inlet pressure; check upstream "
+            "geometry, K losses, mass flow, or parallel passage count."
+        )
+    if inlet.temperature <= 0.0:
+        raise ValueError(
+            f"{edge.edge_id}: inlet node {edge.from_node} temperature must be positive."
+        )
 
     reference_temperature = (
         global_reference_temperature
@@ -135,15 +146,17 @@ def _smooth(
     properties,
 ) -> _HeatTransferResult:
     geom = edge.geometry
+    parallel_passages = _parallel_passages(edge)
+    local_mass_flow = mass_flow / parallel_passages
     area = geom.flow_area()
     dh = geom.hydraulic_diameter()
-    velocity = mass_flow / (properties.rho * area)
+    velocity = local_mass_flow / (properties.rho * area)
     reynolds = properties.rho * velocity * dh / properties.mu
     warnings = _common_internal_flow_warnings(edge.edge_id, reynolds, geom.length, dh)
     nusselt = 0.023 * reynolds**0.8 * properties.pr**0.3
     htc = nusselt * properties.k / dh
     f_darcy = _darcy_friction(reynolds) * float(edge.params.get("user_f_multiplier", 1.0))
-    heat_area = geom.wetted_perimeter() * geom.length
+    heat_area = geom.wetted_perimeter() * geom.length * parallel_passages
     return _HeatTransferResult(
         reynolds=reynolds,
         nusselt=nusselt,
@@ -152,7 +165,11 @@ def _smooth(
         velocity=velocity,
         heat_transfer_area=heat_area,
         warnings=tuple(warnings),
-        intermediate={"correlation": "Dittus-Boelter"},
+        intermediate={
+            "correlation": "Dittus-Boelter",
+            "parallel_passages": parallel_passages,
+            "local_mass_flow_kg_s": local_mass_flow,
+        },
     )
 
 
@@ -162,9 +179,11 @@ def _rib(
     properties,
 ) -> _HeatTransferResult:
     geom = edge.geometry
+    parallel_passages = _parallel_passages(edge)
+    local_mass_flow = mass_flow / parallel_passages
     area = geom.flow_area()
     dh = geom.hydraulic_diameter()
-    velocity = mass_flow / (properties.rho * area)
+    velocity = local_mass_flow / (properties.rho * area)
     reynolds = properties.rho * velocity * dh / properties.mu
     warnings = _common_internal_flow_warnings(edge.edge_id, reynolds, geom.length, dh)
 
@@ -209,7 +228,9 @@ def _rib(
     stanton = (f_fanning / 2.0) / denominator
     htc = stanton * properties.cp * properties.rho * velocity
     nusselt = htc * dh / properties.k
-    heat_area = geom.wetted_perimeter() * geom.length + _rib_extra_area(edge, dh)
+    heat_area = (
+        geom.wetted_perimeter() * geom.length + _rib_extra_area(edge, dh)
+    ) * parallel_passages
 
     return _HeatTransferResult(
         reynolds=reynolds,
@@ -230,6 +251,8 @@ def _rib(
             "p_over_e": p_over_e,
             "angle_deg": angle_deg,
             "aspect_ratio": aspect_ratio,
+            "parallel_passages": parallel_passages,
+            "local_mass_flow_kg_s": local_mass_flow,
         },
     )
 
@@ -279,6 +302,8 @@ def _pin_fin(
     if geom.shape != "rectangular":
         raise ValueError(f"{edge.edge_id}: pin-fin correlation needs rectangular geometry.")
 
+    parallel_passages = _parallel_passages(edge)
+    local_mass_flow = mass_flow / parallel_passages
     p = edge.params
     pin_diameter = _positive_param(p, "pin_diameter", edge.edge_id)
     pin_height = _positive_param(p, "pin_height", edge.edge_id)
@@ -293,7 +318,7 @@ def _pin_fin(
     open_width = max(width - pins_cross * pin_diameter, 1e-9)
     blocked_height = min(pin_height, height)
     min_area = max(open_width * blocked_height, 1e-12)
-    velocity_max = mass_flow / (properties.rho * min_area)
+    velocity_max = local_mass_flow / (properties.rho * min_area)
     reynolds = properties.rho * velocity_max * pin_diameter / properties.mu
     x_over_d = pitch_x / pin_diameter
     s_over_d = pitch_s / pin_diameter
@@ -314,13 +339,13 @@ def _pin_fin(
     htc = nusselt * properties.k / pin_diameter
     dh = geom.hydraulic_diameter()
     bulk_area = geom.flow_area()
-    bulk_velocity = mass_flow / (properties.rho * bulk_area)
+    bulk_velocity = local_mass_flow / (properties.rho * bulk_area)
     re_bulk = properties.rho * bulk_velocity * dh / properties.mu
     f_darcy = _darcy_friction(re_bulk) * float(p.get("user_f_multiplier", 1.0))
     base_area = geom.wetted_perimeter() * geom.length
     lateral_area = total_pins * pi * pin_diameter * pin_height
     tip_area = total_pins * pi * pin_diameter**2 / 4.0
-    heat_area = base_area + lateral_area + tip_area
+    heat_area = (base_area + lateral_area + tip_area) * parallel_passages
 
     return _HeatTransferResult(
         reynolds=reynolds,
@@ -348,6 +373,8 @@ def _pin_fin(
             "total_pins": total_pins,
             "pin_lateral_area_m2": lateral_area,
             "pin_tip_area_m2": tip_area,
+            "parallel_passages": parallel_passages,
+            "local_mass_flow_kg_s": local_mass_flow,
         },
     )
 
@@ -420,6 +447,13 @@ def _positive_param(params: dict[str, Any], name: str, edge_id: str) -> float:
     if value is None or float(value) <= 0.0:
         raise ValueError(f"{edge_id}: parameter {name} must be positive.")
     return float(value)
+
+
+def _parallel_passages(edge: EdgeSpec) -> float:
+    value = float(edge.params.get("parallel_passages", 1.0))
+    if value <= 0.0:
+        raise ValueError(f"{edge.edge_id}: parallel_passages must be positive.")
+    return value
 
 
 def _rib_extra_area(edge: EdgeSpec, hydraulic_diameter: float) -> float:

@@ -66,10 +66,12 @@ class ParamSpec(NamedTuple):
 
 TECH_PARAM_SPECS: dict[str, tuple[ParamSpec, ...]] = {
     "smooth": (
+        ParamSpec("parallel_passages", "Parallel passages [-]", "1"),
         ParamSpec("user_f_multiplier", "Friction multiplier [-]", "1"),
         ParamSpec("user_K_loss", "Minor K loss [-]", "0"),
     ),
     "rib": (
+        ParamSpec("parallel_passages", "Parallel passages [-]", "1"),
         ParamSpec("e_over_dh", "Rib e/Dh [-]"),
         ParamSpec("p_over_e", "Rib pitch/e [-]"),
         ParamSpec("angle_deg", "Rib angle [deg]", "45"),
@@ -79,6 +81,7 @@ TECH_PARAM_SPECS: dict[str, tuple[ParamSpec, ...]] = {
         ParamSpec("ribbed_walls", "Ribbed walls", "2"),
     ),
     "u_turn": (
+        ParamSpec("parallel_passages", "Parallel passages [-]", "1"),
         ParamSpec("nu_multiplier_turn", "Nu multiplier [-]", "1"),
         ParamSpec("k_turn", "Turn K loss [-]", "0"),
         ParamSpec("user_K_loss", "Additional K loss [-]", "0"),
@@ -92,6 +95,7 @@ TECH_PARAM_SPECS: dict[str, tuple[ParamSpec, ...]] = {
         ParamSpec("downstream_height_m", "Downstream height [m]"),
     ),
     "pin_fin": (
+        ParamSpec("parallel_passages", "Parallel passages [-]", "1"),
         ParamSpec("pin_diameter", "Pin diameter [m]"),
         ParamSpec("pin_height", "Pin height [m]"),
         ParamSpec("pitch_x", "Streamwise pitch X [m]"),

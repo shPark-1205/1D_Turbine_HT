@@ -147,6 +147,7 @@ def build_default_network() -> NetworkSpec:
                 "pitch_s": 0.002,
                 "row_count": 16,
                 "pins_cross": 2,
+                "parallel_passages": 6.0,
                 "user_f_multiplier": 3.0,
                 "user_K_loss": 2.0,
             },
