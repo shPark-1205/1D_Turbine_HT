@@ -34,17 +34,14 @@ The same GUI is also available from the example launcher:
 python examples/run_gui.py
 ```
 
-The GUI starts with the current sample network. The opening dashboard follows
-the earlier DLC 1D Streamlit layout: design summary on the left, real-time key
-metrics in the center, and edge-level verification results on the right. Select
-a node or edge, edit its values, click `Apply`, then click `Calculate`. In the
-`Edges` tab, the `Technology` field controls which cooling-technology
-parameters are shown. Full results are shown as node and edge tables, and
-warnings are collected in a separate tab.
-
-The `Passage Layout` tab can load a turbine internal-passage image and overlay
-the current node-edge network. This first layout version is for visual checking;
-node and edge editing still happens in the table tabs.
+The GUI starts with the current sample network in a single `Workspace` screen.
+Load a turbine internal-passage image, drag nodes to the desired locations, and
+select nodes or edges directly on the image. Node and edge editors are shown on
+the right side of the same screen. Use `Add Node` to place a node by clicking on
+the image, and `Connect Nodes` to create an edge by clicking a source node and a
+target node. The `Technology` field controls which cooling-technology
+parameters are shown. Full calculation results and warnings remain available in
+separate result tabs.
 
 ## Install Optional Dependencies
 

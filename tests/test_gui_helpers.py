@@ -5,10 +5,12 @@ import unittest
 from internal_passage_1d.gui import (
     DEFAULT_NODE_POSITIONS,
     _auto_node_positions,
+    _point_to_segment_distance,
     _edge_to_row,
     _params_from_row,
     _param_row_key,
     _parse_params,
+    _unique_id,
 )
 from internal_passage_1d.sample_cases import build_default_network
 
@@ -78,6 +80,13 @@ class GuiHelperTest(unittest.TestCase):
             self.assertLessEqual(x_pos, 1.0)
             self.assertGreaterEqual(y_pos, 0.0)
             self.assertLessEqual(y_pos, 1.0)
+
+    def test_canvas_geometry_helpers(self) -> None:
+        self.assertEqual(_unique_id("A_to_B", {"A_to_B"}), "A_to_B_2")
+        self.assertAlmostEqual(
+            _point_to_segment_distance(5.0, 2.0, 0.0, 0.0, 10.0, 0.0),
+            2.0,
+        )
 
 
 if __name__ == "__main__":

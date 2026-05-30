@@ -131,6 +131,12 @@ class PassageApp(tk.Tk):
         self._layout_native_photo: tk.PhotoImage | None = None
         self._layout_photo: Any = None
         self._layout_image_bbox = (20.0, 20.0, 1.0, 1.0)
+        self.selected_node_id: str | None = None
+        self.selected_edge_id: str | None = None
+        self._layout_mode = tk.StringVar(value="select")
+        self._pending_edge_from: str | None = None
+        self._drag_node_id: str | None = None
+        self._drag_started = False
 
         self.property_model = tk.StringVar(value="ideal_gas")
         self.auto_calculate = tk.BooleanVar(value=False)
@@ -327,25 +333,361 @@ class PassageApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
-        self.dashboard_tab = ttk.Frame(self.notebook)
-        self.layout_tab = ttk.Frame(self.notebook)
-        self.nodes_tab = ttk.Frame(self.notebook)
-        self.edges_tab = ttk.Frame(self.notebook)
+        self.workspace_tab = ttk.Frame(self.notebook)
         self.results_tab = ttk.Frame(self.notebook)
         self.warnings_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.dashboard_tab, text="Dashboard")
-        self.notebook.add(self.layout_tab, text="Passage Layout")
-        self.notebook.add(self.nodes_tab, text="Nodes")
-        self.notebook.add(self.edges_tab, text="Edges")
+        self.notebook.add(self.workspace_tab, text="Workspace")
         self.notebook.add(self.results_tab, text="Results")
         self.notebook.add(self.warnings_tab, text="Warnings")
 
-        self._build_dashboard_tab()
-        self._build_layout_tab()
-        self._build_nodes_tab()
-        self._build_edges_tab()
+        self._build_workspace_tab()
         self._build_results_tab()
         self._build_warnings_tab()
+
+    def _build_workspace_tab(self) -> None:
+        main = ttk.PanedWindow(self.workspace_tab, orient=tk.HORIZONTAL)
+        main.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        left = ttk.Frame(main)
+        right_container = ttk.Frame(main)
+        main.add(left, weight=5)
+        main.add(right_container, weight=3)
+
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        canvas_toolbar = self._panel(left)
+        canvas_toolbar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Label(
+            canvas_toolbar,
+            text="Passage Layout & Network Editor",
+            style="Section.TLabel",
+        ).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Button(
+            canvas_toolbar,
+            text="Load Image",
+            command=self.load_layout_image,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            canvas_toolbar,
+            text="Select / Move",
+            command=self.set_select_mode,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            canvas_toolbar,
+            text="Add Node",
+            command=self.set_add_node_mode,
+            style="Accent.TButton",
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            canvas_toolbar,
+            text="Connect Nodes",
+            command=self.set_connect_edge_mode,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            canvas_toolbar,
+            text="Reset Positions",
+            command=self.reset_layout_positions,
+        ).pack(side=tk.LEFT)
+        self.layout_status_label = ttk.Label(
+            canvas_toolbar,
+            text="Mode: Select / Move",
+            style="Header.TLabel",
+        )
+        self.layout_status_label.pack(side=tk.RIGHT)
+
+        canvas_panel = self._panel(left)
+        canvas_panel.grid(row=1, column=0, sticky=tk.NSEW)
+        canvas_panel.rowconfigure(0, weight=1)
+        canvas_panel.columnconfigure(0, weight=1)
+        self.layout_canvas = tk.Canvas(
+            canvas_panel,
+            bg="#eef3f8",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+        )
+        self.layout_canvas.grid(row=0, column=0, sticky=tk.NSEW)
+        self.layout_canvas.bind(
+            "<Configure>",
+            lambda _event: self._redraw_layout_canvas(),
+        )
+        self.layout_canvas.bind("<ButtonPress-1>", self._on_layout_press)
+        self.layout_canvas.bind("<B1-Motion>", self._on_layout_drag)
+        self.layout_canvas.bind("<ButtonRelease-1>", self._on_layout_release)
+
+        right_canvas = tk.Canvas(
+            right_container,
+            highlightthickness=0,
+            bg=WINDOW_BG,
+        )
+        right_scroll = ttk.Scrollbar(
+            right_container,
+            orient=tk.VERTICAL,
+            command=right_canvas.yview,
+        )
+        right_canvas.configure(yscrollcommand=right_scroll.set)
+        right_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = ttk.Frame(right_canvas, padding=(0, 0, 8, 0))
+        right_window = right_canvas.create_window((0, 0), window=right, anchor=tk.NW)
+
+        def resize_scroll_region(_event: tk.Event) -> None:
+            right_canvas.configure(scrollregion=right_canvas.bbox(tk.ALL))
+
+        def resize_form_width(event: tk.Event) -> None:
+            right_canvas.itemconfigure(right_window, width=event.width)
+
+        right.bind("<Configure>", resize_scroll_region)
+        right_canvas.bind("<Configure>", resize_form_width)
+
+        self._build_workspace_summary(right)
+        self._build_workspace_node_editor(right)
+        self._build_workspace_edge_editor(right)
+        self._build_workspace_tables(right)
+
+    def _build_workspace_summary(self, parent: ttk.Frame) -> None:
+        summary_panel = self._panel(parent)
+        summary_panel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            summary_panel,
+            text="Design Summary",
+            style="Section.TLabel",
+        ).pack(anchor=tk.W, pady=(0, 8))
+        self.dashboard_summary_frame = ttk.Frame(summary_panel, style="Panel.TFrame")
+        self.dashboard_summary_frame.pack(fill=tk.X)
+        self._summary_labels = {}
+        for label, key in (
+            ("Nodes", "nodes"),
+            ("Edges", "edges"),
+            ("Inlets", "inlets"),
+            ("Total inlet flow", "flow"),
+            ("Property model", "property_model"),
+        ):
+            self._summary_row(self.dashboard_summary_frame, label, key)
+
+        self.metric_cards_frame = ttk.Frame(summary_panel, style="Panel.TFrame")
+        self.metric_cards_frame.pack(fill=tk.X, pady=(10, 0))
+        self.metric_labels = {}
+        for title, key in (
+            ("Outlet pressure", "outlet_pressure"),
+            ("Outlet temperature", "outlet_temperature"),
+            ("Total pressure drop", "total_dp"),
+            ("Total heat transfer", "total_heat"),
+            ("Max HTC", "max_htc"),
+            ("Warnings", "warnings"),
+        ):
+            self._metric_card(self.metric_cards_frame, title, key)
+        self.dashboard_status_label = tk.Label(
+            summary_panel,
+            text="READY",
+            bg="#e7f3ec",
+            fg=SAFE_COLOR,
+            font=("Segoe UI", 14, "bold"),
+            padx=12,
+            pady=8,
+        )
+        self.dashboard_status_label.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(
+            summary_panel,
+            text="Warnings Preview",
+            style="SmallSection.TLabel",
+        ).pack(anchor=tk.W, pady=(10, 4))
+        self.dashboard_warning_text = tk.Text(
+            summary_panel,
+            height=5,
+            wrap=tk.WORD,
+            bg="#fbfcfe",
+            fg=TEXT_COLOR,
+            font=("Segoe UI", 11),
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+        )
+        self.dashboard_warning_text.pack(fill=tk.X)
+
+    def _build_workspace_node_editor(self, parent: ttk.Frame) -> None:
+        node_panel = self._panel(parent)
+        node_panel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(node_panel, text="Selected Node", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8)
+        )
+        self._labeled_entry(node_panel, 1, "Node ID", self._node_vars["node_id"])
+        ttk.Label(node_panel, text="Kind", style="Header.TLabel").grid(
+            row=2, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Combobox(
+            node_panel,
+            textvariable=self._node_vars["kind"],
+            values=NODE_KINDS,
+            state="readonly",
+            width=20,
+        ).grid(row=2, column=1, sticky=tk.EW, pady=3)
+        self._labeled_entry(
+            node_panel,
+            3,
+            "Inlet m_dot [kg/s]",
+            self._node_vars["inlet_mdot"],
+        )
+        self._labeled_entry(
+            node_panel,
+            4,
+            "Inlet temperature [K]",
+            self._node_vars["inlet_temperature"],
+        )
+        self._labeled_entry(
+            node_panel,
+            5,
+            "Inlet pressure [Pa]",
+            self._node_vars["inlet_pressure"],
+        )
+        node_panel.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(node_panel, style="Panel.TFrame")
+        buttons.grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+        ttk.Button(buttons, text="Apply Node", command=self.apply_node).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(buttons, text="Add Node", command=self.add_node).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(buttons, text="Delete Node", command=self.delete_node).pack(
+            side=tk.LEFT
+        )
+
+    def _build_workspace_edge_editor(self, parent: ttk.Frame) -> None:
+        edge_panel = self._panel(parent)
+        edge_panel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(edge_panel, text="Selected Edge", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8)
+        )
+        row = 1
+        self._labeled_entry(edge_panel, row, "Edge ID", self._edge_vars["edge_id"])
+        row += 1
+        self._labeled_combo(edge_panel, row, "From node", self._edge_vars["from_node"], ())
+        self.edge_from_combo = edge_panel.grid_slaves(row=row, column=1)[0]
+        row += 1
+        self._labeled_combo(edge_panel, row, "To node", self._edge_vars["to_node"], ())
+        self.edge_to_combo = edge_panel.grid_slaves(row=row, column=1)[0]
+        row += 1
+        self._labeled_combo(
+            edge_panel,
+            row,
+            "Technology",
+            self._edge_vars["cooling_technology"],
+            TECHNOLOGIES,
+        )
+        row += 1
+        self._labeled_combo(edge_panel, row, "Shape", self._edge_vars["shape"], SHAPES)
+        row += 1
+        for label, key in (
+            ("Length [m]", "length"),
+            ("Width [m]", "width"),
+            ("Height [m]", "height"),
+            ("Diameter [m]", "diameter"),
+        ):
+            self._labeled_entry(edge_panel, row, label, self._edge_vars[key])
+            row += 1
+        self._labeled_combo(edge_panel, row, "Wall mode", self._edge_vars["wall_mode"], WALL_MODES)
+        row += 1
+        for label, key in (
+            ("Wall T [K]", "wall_temperature"),
+            ("Heat flux [W/m2]", "heat_flux"),
+            ("External h [W/m2-K]", "external_htc"),
+            ("Flow fraction", "flow_fraction"),
+            ("Fixed m_dot [kg/s]", "fixed_mdot"),
+        ):
+            self._labeled_entry(edge_panel, row, label, self._edge_vars[key])
+            row += 1
+
+        self.tech_param_frame = ttk.LabelFrame(
+            edge_panel,
+            text="Cooling technology parameters",
+            padding=8,
+        )
+        self.tech_param_frame.grid(
+            row=row,
+            column=0,
+            columnspan=2,
+            sticky=tk.EW,
+            pady=(8, 4),
+        )
+        row += 1
+
+        ttk.Label(edge_panel, text="Additional params", style="Header.TLabel").grid(
+            row=row, column=0, sticky=tk.NW, pady=3
+        )
+        self.params_text = tk.Text(edge_panel, height=4, width=32, wrap=tk.NONE)
+        self.params_text.grid(row=row, column=1, sticky=tk.NSEW, pady=3)
+        row += 1
+        edge_panel.columnconfigure(1, weight=1)
+        self._render_tech_params("smooth")
+
+        buttons = ttk.Frame(edge_panel, style="Panel.TFrame")
+        buttons.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+        ttk.Button(buttons, text="Apply Edge", command=self.apply_edge).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(buttons, text="Add Edge", command=self.add_edge).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(buttons, text="Delete Edge", command=self.delete_edge).pack(
+            side=tk.LEFT
+        )
+
+    def _build_workspace_tables(self, parent: ttk.Frame) -> None:
+        table_panel = self._panel(parent)
+        table_panel.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(table_panel, text="Network Tables", style="Section.TLabel").pack(
+            anchor=tk.W,
+            pady=(0, 8),
+        )
+
+        ttk.Label(table_panel, text="Nodes", style="SmallSection.TLabel").pack(
+            anchor=tk.W,
+            pady=(0, 4),
+        )
+        node_columns = ("node_id", "kind", "mdot", "temperature", "pressure")
+        self.node_tree = ttk.Treeview(
+            table_panel,
+            columns=node_columns,
+            show="headings",
+            height=5,
+        )
+        node_headings = {
+            "node_id": "Node",
+            "kind": "Kind",
+            "mdot": "m_dot",
+            "temperature": "T",
+            "pressure": "P",
+        }
+        for column in node_columns:
+            self.node_tree.heading(column, text=node_headings[column])
+            self.node_tree.column(column, width=72, anchor=tk.W)
+        self.node_tree.pack(fill=tk.X)
+        self.node_tree.bind("<<TreeviewSelect>>", self._on_node_select)
+
+        ttk.Label(table_panel, text="Edges", style="SmallSection.TLabel").pack(
+            anchor=tk.W,
+            pady=(10, 4),
+        )
+        edge_columns = ("edge_id", "route", "tech", "length")
+        self.edge_tree = ttk.Treeview(
+            table_panel,
+            columns=edge_columns,
+            show="headings",
+            height=7,
+        )
+        edge_headings = {
+            "edge_id": "Edge",
+            "route": "Route",
+            "tech": "Tech",
+            "length": "L",
+        }
+        for column in edge_columns:
+            self.edge_tree.heading(column, text=edge_headings[column])
+            self.edge_tree.column(column, width=88, anchor=tk.W)
+        self.edge_tree.pack(fill=tk.X)
+        self.edge_tree.bind("<<TreeviewSelect>>", self._on_edge_select)
 
     def _build_dashboard_tab(self) -> None:
         main = ttk.Frame(self.dashboard_tab, padding=4)
@@ -763,13 +1105,14 @@ class PassageApp(tk.Tk):
                 continue
             x1, y1 = self._layout_to_canvas(from_pos)
             x2, y2 = self._layout_to_canvas(to_pos)
+            is_selected = row["edge_id"] == self.selected_edge_id
             canvas.create_line(
                 x1,
                 y1,
                 x2,
                 y2,
-                fill=ACCENT_COLOR,
-                width=3,
+                fill=WARNING_COLOR if is_selected else ACCENT_COLOR,
+                width=5 if is_selected else 3,
                 arrow=tk.LAST,
                 arrowshape=(14, 16, 6),
             )
@@ -780,8 +1123,8 @@ class PassageApp(tk.Tk):
                 mid_y - 12,
                 mid_x + 28,
                 mid_y + 12,
-                fill="#ffffff",
-                outline=BORDER_COLOR,
+                fill="#fff8e8" if is_selected else "#ffffff",
+                outline=WARNING_COLOR if is_selected else BORDER_COLOR,
             )
             canvas.create_text(
                 mid_x,
@@ -799,7 +1142,8 @@ class PassageApp(tk.Tk):
                 continue
             x, y = self._layout_to_canvas(position)
             radius = 15 if row["kind"] != "inlet" else 17
-            fill = "#ffffff"
+            is_selected = node_id == self.selected_node_id
+            fill = "#fff8e8" if is_selected else "#ffffff"
             outline = ACCENT_COLOR
             if row["kind"] == "inlet":
                 outline = SAFE_COLOR
@@ -807,6 +1151,8 @@ class PassageApp(tk.Tk):
                 outline = WARNING_COLOR
             elif row["kind"] == "outlet":
                 outline = DANGER_COLOR
+            if is_selected:
+                outline = WARNING_COLOR
             canvas.create_oval(
                 x - radius,
                 y - radius,
@@ -814,7 +1160,7 @@ class PassageApp(tk.Tk):
                 y + radius,
                 fill=fill,
                 outline=outline,
-                width=3,
+                width=4 if is_selected else 3,
             )
             canvas.create_text(
                 x,
@@ -827,6 +1173,208 @@ class PassageApp(tk.Tk):
     def _layout_to_canvas(self, position: tuple[float, float]) -> tuple[float, float]:
         x0, y0, width, height = self._layout_image_bbox
         return x0 + position[0] * width, y0 + position[1] * height
+
+    def _canvas_to_layout(self, x_pos: float, y_pos: float) -> tuple[float, float]:
+        x0, y0, width, height = self._layout_image_bbox
+        x_norm = (x_pos - x0) / max(width, 1e-9)
+        y_norm = (y_pos - y0) / max(height, 1e-9)
+        return _clamp01(x_norm), _clamp01(y_norm)
+
+    def set_select_mode(self) -> None:
+        self._layout_mode.set("select")
+        self._pending_edge_from = None
+        self._update_layout_status("Mode: Select / Move")
+
+    def set_add_node_mode(self) -> None:
+        self._layout_mode.set("add_node")
+        self._pending_edge_from = None
+        self._update_layout_status("Mode: Add Node - click the image")
+
+    def set_connect_edge_mode(self) -> None:
+        self._layout_mode.set("connect_edge")
+        self._pending_edge_from = None
+        self._update_layout_status("Mode: Connect Nodes - click source node")
+
+    def _update_layout_status(self, text: str) -> None:
+        if hasattr(self, "layout_status_label"):
+            self.layout_status_label.configure(text=text)
+
+    def _on_layout_press(self, event: tk.Event) -> None:
+        mode = self._layout_mode.get()
+        node_id = self._node_at_canvas(event.x, event.y)
+        if mode == "add_node":
+            self._add_node_at_position(self._canvas_to_layout(event.x, event.y))
+            self.set_select_mode()
+            return
+        if mode == "connect_edge":
+            if node_id is None:
+                return
+            if self._pending_edge_from is None:
+                self._pending_edge_from = node_id
+                self._select_node_by_id(node_id)
+                self._update_layout_status(
+                    f"Mode: Connect Nodes - source {node_id}, click target node"
+                )
+                return
+            if node_id == self._pending_edge_from:
+                self._update_layout_status("Select a different target node")
+                return
+            self._create_edge_between(self._pending_edge_from, node_id)
+            self.set_select_mode()
+            return
+
+        if node_id is not None:
+            self._select_node_by_id(node_id)
+            self._drag_node_id = node_id
+            self._drag_started = False
+            return
+
+        edge_id = self._edge_at_canvas(event.x, event.y)
+        if edge_id is not None:
+            self._select_edge_by_id(edge_id)
+            return
+
+        self.selected_node_id = None
+        self.selected_edge_id = None
+        self._redraw_layout_canvas()
+
+    def _on_layout_drag(self, event: tk.Event) -> None:
+        if self._layout_mode.get() != "select" or self._drag_node_id is None:
+            return
+        self.node_positions[self._drag_node_id] = self._canvas_to_layout(
+            event.x,
+            event.y,
+        )
+        self._drag_started = True
+        self._redraw_layout_canvas()
+
+    def _on_layout_release(self, _event: tk.Event) -> None:
+        if self._drag_node_id is not None and self._drag_started:
+            self._redraw_layout_canvas()
+        self._drag_node_id = None
+        self._drag_started = False
+
+    def _node_at_canvas(self, x_pos: float, y_pos: float) -> str | None:
+        nearest_node: str | None = None
+        nearest_distance = 1e9
+        for row in self.node_rows:
+            node_id = row["node_id"]
+            position = self.node_positions.get(node_id)
+            if position is None:
+                continue
+            x_node, y_node = self._layout_to_canvas(position)
+            distance = ((x_pos - x_node) ** 2 + (y_pos - y_node) ** 2) ** 0.5
+            if distance <= 22 and distance < nearest_distance:
+                nearest_node = node_id
+                nearest_distance = distance
+        return nearest_node
+
+    def _edge_at_canvas(self, x_pos: float, y_pos: float) -> str | None:
+        nearest_edge: str | None = None
+        nearest_distance = 1e9
+        for row in self.edge_rows:
+            from_pos = self.node_positions.get(row["from_node"])
+            to_pos = self.node_positions.get(row["to_node"])
+            if from_pos is None or to_pos is None:
+                continue
+            x1, y1 = self._layout_to_canvas(from_pos)
+            x2, y2 = self._layout_to_canvas(to_pos)
+            distance = _point_to_segment_distance(x_pos, y_pos, x1, y1, x2, y2)
+            if distance <= 9 and distance < nearest_distance:
+                nearest_edge = row["edge_id"]
+                nearest_distance = distance
+        return nearest_edge
+
+    def _select_node_by_id(self, node_id: str) -> None:
+        index = self._node_index(node_id)
+        if index is None:
+            return
+        self.selected_node_id = node_id
+        self.selected_edge_id = None
+        self.node_tree.selection_set(str(index))
+        self.node_tree.focus(str(index))
+        self._populate_node_form(index)
+        if hasattr(self, "edge_tree"):
+            self.edge_tree.selection_remove(self.edge_tree.selection())
+        self._redraw_layout_canvas()
+
+    def _select_edge_by_id(self, edge_id: str) -> None:
+        index = self._edge_index(edge_id)
+        if index is None:
+            return
+        self.selected_edge_id = edge_id
+        self.selected_node_id = None
+        self.edge_tree.selection_set(str(index))
+        self.edge_tree.focus(str(index))
+        self._populate_edge_form(index)
+        if hasattr(self, "node_tree"):
+            self.node_tree.selection_remove(self.node_tree.selection())
+        self._redraw_layout_canvas()
+
+    def _node_index(self, node_id: str) -> int | None:
+        for index, row in enumerate(self.node_rows):
+            if row["node_id"] == node_id:
+                return index
+        return None
+
+    def _edge_index(self, edge_id: str) -> int | None:
+        for index, row in enumerate(self.edge_rows):
+            if row["edge_id"] == edge_id:
+                return index
+        return None
+
+    def _add_node_at_position(self, position: tuple[float, float]) -> None:
+        node_id = self._next_id("N", {row["node_id"] for row in self.node_rows})
+        self.node_rows.append(
+            {
+                "node_id": node_id,
+                "kind": "internal",
+                "inlet_mdot": "",
+                "inlet_temperature": "",
+                "inlet_pressure": "",
+            }
+        )
+        self.node_positions[node_id] = position
+        self._ensure_node_positions()
+        self._refresh_node_tree()
+        self._refresh_node_combos()
+        self._update_dashboard_summary()
+        self._select_node_by_id(node_id)
+
+    def _create_edge_between(self, from_node: str, to_node: str) -> None:
+        existing_ids = {row["edge_id"] for row in self.edge_rows}
+        base_id = f"{from_node}_to_{to_node}".replace(" ", "_")
+        edge_id = _unique_id(base_id, existing_ids)
+        self.edge_rows.append(self._default_edge_row(edge_id, from_node, to_node))
+        self._refresh_edge_tree()
+        self._update_dashboard_summary()
+        self._select_edge_by_id(edge_id)
+
+    def _default_edge_row(
+        self,
+        edge_id: str,
+        from_node: str,
+        to_node: str,
+    ) -> dict[str, str]:
+        return {
+            "edge_id": edge_id,
+            "from_node": from_node,
+            "to_node": to_node,
+            "cooling_technology": "smooth",
+            "shape": "rectangular",
+            "length": "0.1",
+            "width": "0.01",
+            "height": "0.01",
+            "diameter": "",
+            "wall_mode": "adiabatic",
+            "wall_temperature": "",
+            "heat_flux": "",
+            "external_htc": "",
+            "flow_fraction": "",
+            "fixed_mdot": "",
+            "params_text": "",
+            **_default_param_row("smooth"),
+        }
 
     def _build_nodes_tab(self) -> None:
         pane = ttk.PanedWindow(self.nodes_tab, orient=tk.HORIZONTAL)
@@ -1202,10 +1750,12 @@ class PassageApp(tk.Tk):
             self.node_tree.selection_set("0")
             self.node_tree.focus("0")
             self._populate_node_form(0)
+            self.selected_node_id = self.node_rows[0]["node_id"]
         if self.edge_rows:
             self.edge_tree.selection_set("0")
             self.edge_tree.focus("0")
             self._populate_edge_form(0)
+        self._redraw_layout_canvas()
 
     def _refresh_node_tree(self) -> None:
         self.node_tree.delete(*self.node_tree.get_children())
@@ -1225,12 +1775,17 @@ class PassageApp(tk.Tk):
 
     def _refresh_edge_tree(self) -> None:
         self.edge_tree.delete(*self.edge_tree.get_children())
+        columns = tuple(self.edge_tree["columns"])
         for index, row in enumerate(self.edge_rows):
-            self.edge_tree.insert(
-                "",
-                tk.END,
-                iid=str(index),
-                values=(
+            if columns == ("edge_id", "route", "tech", "length"):
+                values = (
+                    row["edge_id"],
+                    f'{row["from_node"]} -> {row["to_node"]}',
+                    row["cooling_technology"],
+                    row["length"],
+                )
+            else:
+                values = (
                     row["edge_id"],
                     f'{row["from_node"]} -> {row["to_node"]}',
                     row["cooling_technology"],
@@ -1238,7 +1793,12 @@ class PassageApp(tk.Tk):
                     row["width"],
                     row["height"],
                     row["diameter"],
-                ),
+                )
+            self.edge_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=values,
             )
         self._refresh_dashboard_map()
         self._redraw_layout_canvas()
@@ -1266,12 +1826,18 @@ class PassageApp(tk.Tk):
     def _on_node_select(self, _event: tk.Event) -> None:
         index = self._selected_index(self.node_tree)
         if index is not None:
+            self.selected_node_id = self.node_rows[index]["node_id"]
+            self.selected_edge_id = None
             self._populate_node_form(index)
+            self._redraw_layout_canvas()
 
     def _on_edge_select(self, _event: tk.Event) -> None:
         index = self._selected_index(self.edge_tree)
         if index is not None:
+            self.selected_edge_id = self.edge_rows[index]["edge_id"]
+            self.selected_node_id = None
             self._populate_edge_form(index)
+            self._redraw_layout_canvas()
 
     def _populate_node_form(self, index: int) -> None:
         row = self.node_rows[index]
@@ -1349,19 +1915,18 @@ class PassageApp(tk.Tk):
             messagebox.showwarning("No selection", "Select a node first.")
             return
         node_id = self.node_rows[index]["node_id"]
-        if any(
-            edge["from_node"] == node_id or edge["to_node"] == node_id
-            for edge in self.edge_rows
-        ):
-            messagebox.showerror(
-                "Node in use",
-                "Delete or reroute connected edges before deleting this node.",
-            )
-            return
         del self.node_rows[index]
+        self.edge_rows = [
+            edge
+            for edge in self.edge_rows
+            if edge["from_node"] != node_id and edge["to_node"] != node_id
+        ]
         self.node_positions.pop(node_id, None)
+        self.selected_node_id = None
+        self.selected_edge_id = None
         self._ensure_node_positions()
         self._refresh_node_tree()
+        self._refresh_edge_tree()
         self._refresh_node_combos()
         self._update_dashboard_summary()
         self._redraw_layout_canvas()
@@ -1379,6 +1944,8 @@ class PassageApp(tk.Tk):
             messagebox.showerror("Invalid edge", "Edge ID must be unique.")
             return
         self.edge_rows[index] = row
+        self.selected_edge_id = row["edge_id"]
+        self.selected_node_id = None
         self._refresh_edge_tree()
         self._update_dashboard_summary()
         self.edge_tree.selection_set(str(index))
@@ -1389,28 +1956,15 @@ class PassageApp(tk.Tk):
         if len(node_ids) < 2:
             messagebox.showerror("Need nodes", "Add at least two nodes first.")
             return
-        edge_id = self._next_id("E", {row["edge_id"] for row in self.edge_rows})
-        self.edge_rows.append(
-            {
-                "edge_id": edge_id,
-                "from_node": node_ids[0],
-                "to_node": node_ids[1],
-                "cooling_technology": "smooth",
-                "shape": "rectangular",
-                "length": "0.1",
-                "width": "0.01",
-                "height": "0.01",
-                "diameter": "",
-                "wall_mode": "adiabatic",
-                "wall_temperature": "",
-                "heat_flux": "",
-                "external_htc": "",
-                "flow_fraction": "",
-                "fixed_mdot": "",
-                "params_text": "",
-                **_default_param_row("smooth"),
-            }
+        from_node = self._edge_vars["from_node"].get().strip() or node_ids[0]
+        to_node = self._edge_vars["to_node"].get().strip() or node_ids[1]
+        if from_node not in node_ids or to_node not in node_ids or from_node == to_node:
+            from_node, to_node = node_ids[0], node_ids[1]
+        edge_id = _unique_id(
+            f"{from_node}_to_{to_node}".replace(" ", "_"),
+            {row["edge_id"] for row in self.edge_rows},
         )
+        self.edge_rows.append(self._default_edge_row(edge_id, from_node, to_node))
         self._refresh_edge_tree()
         self._update_dashboard_summary()
         index = len(self.edge_rows) - 1
@@ -1423,6 +1977,7 @@ class PassageApp(tk.Tk):
             messagebox.showwarning("No selection", "Select an edge first.")
             return
         del self.edge_rows[index]
+        self.selected_edge_id = None
         self._refresh_edge_tree()
         self._update_dashboard_summary()
 
@@ -1479,7 +2034,7 @@ class PassageApp(tk.Tk):
         self._show_dashboard(result)
         self._show_warnings(result.warnings)
         if show_success:
-            self.notebook.select(self.dashboard_tab)
+            self.notebook.select(self.workspace_tab)
 
     def _handle_calculation_error(
         self,
@@ -1607,22 +2162,23 @@ class PassageApp(tk.Tk):
 
     def _show_dashboard(self, result: SolverResult) -> None:
         self._update_dashboard_summary()
-        self.dashboard_edge_tree.delete(*self.dashboard_edge_tree.get_children())
-        for edge in result.edges.values():
-            self.dashboard_edge_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    edge.edge_id,
-                    edge.cooling_technology,
-                    _fmt_number(edge.reynolds, 0),
-                    _fmt_number(edge.nusselt, 2),
-                    _fmt_number(edge.htc, 1),
-                    _fmt_number(edge.dp_total, 1),
-                    _fmt_number(edge.outlet_temperature, 2),
-                    _fmt_number(edge.outlet_pressure, 1),
-                ),
-            )
+        if hasattr(self, "dashboard_edge_tree"):
+            self.dashboard_edge_tree.delete(*self.dashboard_edge_tree.get_children())
+            for edge in result.edges.values():
+                self.dashboard_edge_tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        edge.edge_id,
+                        edge.cooling_technology,
+                        _fmt_number(edge.reynolds, 0),
+                        _fmt_number(edge.nusselt, 2),
+                        _fmt_number(edge.htc, 1),
+                        _fmt_number(edge.dp_total, 1),
+                        _fmt_number(edge.outlet_temperature, 2),
+                        _fmt_number(edge.outlet_pressure, 1),
+                    ),
+                )
 
         outlet_nodes = [
             node
@@ -1827,6 +2383,39 @@ def _auto_node_positions(node_ids: list[str]) -> dict[str, tuple[float, float]]:
             y_max - (y_max - y_min) * fraction,
         )
     return positions
+
+
+def _clamp01(value: float) -> float:
+    return min(1.0, max(0.0, value))
+
+
+def _point_to_segment_distance(
+    px: float,
+    py: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+) -> float:
+    dx = x2 - x1
+    dy = y2 - y1
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0.0:
+        return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+    t = ((px - x1) * dx + (py - y1) * dy) / length_sq
+    t = _clamp01(t)
+    closest_x = x1 + t * dx
+    closest_y = y1 + t * dy
+    return ((px - closest_x) ** 2 + (py - closest_y) ** 2) ** 0.5
+
+
+def _unique_id(base_id: str, existing_ids: set[str]) -> str:
+    if base_id not in existing_ids:
+        return base_id
+    index = 2
+    while f"{base_id}_{index}" in existing_ids:
+        index += 1
+    return f"{base_id}_{index}"
 
 
 def _format_params(params: dict[str, Any]) -> str:
