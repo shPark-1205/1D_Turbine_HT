@@ -22,6 +22,40 @@ The first version focuses on:
 python examples/run_fixed_flow_example.py
 ```
 
+## Run the desktop GUI
+
+```powershell
+python examples/run_gui.py
+```
+
+The GUI starts with the current sample network. The opening dashboard follows
+the earlier DLC 1D Streamlit layout: design summary on the left, real-time key
+metrics in the center, and edge-level verification results on the right. Select
+a node or edge, edit its values, click `Apply`, then click `Calculate`. In the
+`Edges` tab, the `Technology` field controls which cooling-technology
+parameters are shown. Full results are shown as node and edge tables, and
+warnings are collected in a separate tab.
+
+## PyCharm workflow
+
+Open this repository folder in PyCharm:
+
+```text
+C:\Users\HTL-SHP\Documents\1D Internal Passage
+```
+
+Use Python 3.10 or newer as the project interpreter. Then run:
+
+```text
+examples/run_gui.py
+```
+
+For code-only checks, run:
+
+```powershell
+python -m unittest discover -s tests
+```
+
 ## Run tests
 
 ```powershell

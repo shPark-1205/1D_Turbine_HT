@@ -5,6 +5,9 @@ description = "Prototype 1D heat-transfer and pressure-drop solver for gas turbi
 requires-python = ">=3.10"
 dependencies = []
 
+[project.scripts]
+internal-passage-gui = "internal_passage_1d.gui:main"
+
 [project.optional-dependencies]
 coolprop = ["CoolProp>=6.6"]
 streamlit = ["streamlit>=1.35"]

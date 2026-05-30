@@ -3,14 +3,14 @@ from __future__ import annotations
 import math
 import unittest
 
-from examples.run_fixed_flow_example import build_example_network
 from internal_passage_1d import FixedFlowSolver, SolverOptions
+from internal_passage_1d.sample_cases import build_default_network
 
 
 class FixedFlowExampleTest(unittest.TestCase):
     def test_example_solves_to_outlet(self) -> None:
         result = FixedFlowSolver(
-            build_example_network(),
+            build_default_network(),
             SolverOptions(property_model="ideal_gas"),
         ).solve()
 
