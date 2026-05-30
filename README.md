@@ -25,6 +25,12 @@ python examples/run_fixed_flow_example.py
 ## Run the desktop GUI
 
 ```powershell
+python run_turbine_1d_gui.py
+```
+
+The same GUI is also available from the example launcher:
+
+```powershell
 python examples/run_gui.py
 ```
 
@@ -47,7 +53,7 @@ C:\Users\HTL-SHP\Documents\1D Internal Passage
 Use Python 3.10 or newer as the project interpreter. Then run:
 
 ```text
-examples/run_gui.py
+run_turbine_1d_gui.py
 ```
 
 For code-only checks, run:
@@ -55,6 +61,18 @@ For code-only checks, run:
 ```powershell
 python -m unittest discover -s tests
 ```
+
+## Distribution Notes
+
+For this early stage, the repository keeps two launch styles:
+
+- `run_turbine_1d_gui.py`: top-level launcher for general users.
+- `examples/run_gui.py`: example/developer launcher that can be updated when
+  reference cases and final correlation parameters are fixed.
+
+For wider internal distribution, the usual next step is to package the GUI as a
+Windows executable with PyInstaller after the correlations and input format are
+stable.
 
 ## Run tests
 

@@ -95,8 +95,9 @@ class PassageApp(tk.Tk):
         super().__init__()
         self.title("1D Turbine Internal Passage Solver")
         self.geometry("1380x860")
-        self.minsize(1180, 760)
+        self.minsize(1260, 780)
         self.configure(bg=WINDOW_BG)
+        self.option_add("*Font", "Segoe UI 11")
 
         self.node_rows: list[dict[str, str]] = []
         self.edge_rows: list[dict[str, str]] = []
@@ -152,10 +153,10 @@ class PassageApp(tk.Tk):
         except tk.TclError:
             pass
 
-        default_font = ("Segoe UI", 9)
-        title_font = ("Segoe UI", 18, "bold")
-        heading_font = ("Segoe UI", 10, "bold")
-        small_heading_font = ("Segoe UI", 9, "bold")
+        default_font = ("Segoe UI", 11)
+        title_font = ("Segoe UI", 21, "bold")
+        heading_font = ("Segoe UI", 12, "bold")
+        small_heading_font = ("Segoe UI", 11, "bold")
 
         style.configure(".", font=default_font, background=WINDOW_BG, foreground=TEXT_COLOR)
         style.configure("TFrame", background=WINDOW_BG)
@@ -174,7 +175,7 @@ class PassageApp(tk.Tk):
             "Subtitle.TLabel",
             background=PANEL_BG,
             foreground=MUTED_COLOR,
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 11),
         )
         style.configure(
             "Section.TLabel",
@@ -198,8 +199,8 @@ class PassageApp(tk.Tk):
         style.configure("TNotebook", background=WINDOW_BG, borderwidth=0)
         style.configure(
             "TNotebook.Tab",
-            padding=(14, 8),
-            font=("Segoe UI", 9, "bold"),
+            padding=(16, 9),
+            font=("Segoe UI", 11, "bold"),
         )
         style.map(
             "TNotebook.Tab",
@@ -210,30 +211,35 @@ class PassageApp(tk.Tk):
             "Accent.TButton",
             background=ACCENT_COLOR,
             foreground="#ffffff",
-            padding=(12, 7),
-            font=("Segoe UI", 9, "bold"),
+            padding=(13, 8),
+            font=("Segoe UI", 11, "bold"),
         )
         style.map(
             "Accent.TButton",
             background=[("active", "#17629a"), ("pressed", "#14557f")],
             foreground=[("active", "#ffffff"), ("pressed", "#ffffff")],
         )
-        style.configure("TButton", padding=(10, 6))
+        style.configure("TButton", padding=(11, 7), font=("Segoe UI", 11))
         style.configure(
             "Treeview",
             background=PANEL_BG,
             fieldbackground=PANEL_BG,
             foreground=TEXT_COLOR,
-            rowheight=25,
+            rowheight=32,
             borderwidth=0,
+            font=("Segoe UI", 11),
         )
         style.configure(
             "Treeview.Heading",
             background="#edf3f8",
             foreground=TEXT_COLOR,
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 11, "bold"),
         )
-        style.map("Treeview", background=[("selected", "#d7ebfb")])
+        style.map(
+            "Treeview",
+            background=[("selected", "#b9dcff")],
+            foreground=[("selected", "#111827")],
+        )
 
     def _build_widgets(self) -> None:
         header = tk.Frame(
@@ -384,7 +390,7 @@ class PassageApp(tk.Tk):
             text="READY",
             bg="#e7f3ec",
             fg=SAFE_COLOR,
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 14, "bold"),
             padx=12,
             pady=8,
         )
@@ -452,6 +458,7 @@ class PassageApp(tk.Tk):
             wrap=tk.WORD,
             bg="#fbfcfe",
             fg=TEXT_COLOR,
+            font=("Segoe UI", 11),
             relief=tk.FLAT,
             padx=8,
             pady=8,
@@ -482,7 +489,7 @@ class PassageApp(tk.Tk):
             row,
             text="-",
             style="Header.TLabel",
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 11, "bold"),
         )
         value.pack(side=tk.RIGHT)
         self._summary_labels[key] = value
@@ -502,14 +509,14 @@ class PassageApp(tk.Tk):
             text=title,
             bg="#fbfcfe",
             fg=MUTED_COLOR,
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 11),
         ).pack(anchor=tk.W)
         value = tk.Label(
             card,
             text="-",
             bg="#fbfcfe",
             fg=TEXT_COLOR,
-            font=("Segoe UI", 15, "bold"),
+            font=("Segoe UI", 18, "bold"),
         )
         value.pack(anchor=tk.W, pady=(2, 0))
         self.metric_labels[key] = value
