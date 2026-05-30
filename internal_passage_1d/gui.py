@@ -6,6 +6,12 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, NamedTuple
 
+try:
+    from PIL import Image, ImageTk
+except ImportError:  # pragma: no cover - exercised only when Pillow is absent.
+    Image = None
+    ImageTk = None
+
 from .models import (
     EdgeSpec,
     Geometry,
@@ -24,6 +30,12 @@ TECHNOLOGIES = ("smooth", "rib", "u_turn", "pin_fin")
 SHAPES = ("rectangular", "circular")
 WALL_MODES = ("adiabatic", "wall_temperature", "heat_flux")
 PROPERTY_MODELS = ("ideal_gas", "coolprop")
+IMAGE_FILETYPES = (
+    ("Image files", "*.png *.jpg *.jpeg *.gif *.ppm *.pgm"),
+    ("PNG files", "*.png"),
+    ("JPEG files", "*.jpg *.jpeg"),
+    ("All files", "*.*"),
+)
 ACCENT_COLOR = "#1f77b4"
 TEXT_COLOR = "#31333F"
 MUTED_COLOR = "#5c6670"
@@ -33,6 +45,17 @@ BORDER_COLOR = "#d8e1ec"
 SAFE_COLOR = "#0f7b3d"
 WARNING_COLOR = "#b36b00"
 DANGER_COLOR = "#b00020"
+DEFAULT_NODE_POSITIONS: dict[str, tuple[float, float]] = {
+    "1-1": (0.82, 0.78),
+    "1-2": (0.48, 0.86),
+    "2": (0.69, 0.69),
+    "3": (0.69, 0.13),
+    "4": (0.54, 0.13),
+    "5": (0.55, 0.70),
+    "6": (0.44, 0.70),
+    "7": (0.31, 0.34),
+    "8": (0.11, 0.34),
+}
 
 
 class ParamSpec(NamedTuple):
@@ -102,6 +125,12 @@ class PassageApp(tk.Tk):
         self.edge_rows: list[dict[str, str]] = []
         self.last_result: SolverResult | None = None
         self._syncing_edge_form = False
+        self.node_positions: dict[str, tuple[float, float]] = {}
+        self.layout_image_path: Path | None = None
+        self._layout_source_image: Any = None
+        self._layout_native_photo: tk.PhotoImage | None = None
+        self._layout_photo: Any = None
+        self._layout_image_bbox = (20.0, 20.0, 1.0, 1.0)
 
         self.property_model = tk.StringVar(value="ideal_gas")
         self.auto_calculate = tk.BooleanVar(value=False)
@@ -299,17 +328,20 @@ class PassageApp(tk.Tk):
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
         self.dashboard_tab = ttk.Frame(self.notebook)
+        self.layout_tab = ttk.Frame(self.notebook)
         self.nodes_tab = ttk.Frame(self.notebook)
         self.edges_tab = ttk.Frame(self.notebook)
         self.results_tab = ttk.Frame(self.notebook)
         self.warnings_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.dashboard_tab, text="Dashboard")
+        self.notebook.add(self.layout_tab, text="Passage Layout")
         self.notebook.add(self.nodes_tab, text="Nodes")
         self.notebook.add(self.edges_tab, text="Edges")
         self.notebook.add(self.results_tab, text="Results")
         self.notebook.add(self.warnings_tab, text="Warnings")
 
         self._build_dashboard_tab()
+        self._build_layout_tab()
         self._build_nodes_tab()
         self._build_edges_tab()
         self._build_results_tab()
@@ -519,6 +551,282 @@ class PassageApp(tk.Tk):
         )
         value.pack(anchor=tk.W, pady=(2, 0))
         self.metric_labels[key] = value
+
+    def _build_layout_tab(self) -> None:
+        main = ttk.Frame(self.layout_tab, padding=4)
+        main.pack(fill=tk.BOTH, expand=True)
+        main.columnconfigure(0, weight=0)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        tools_panel = self._panel(main)
+        tools_panel.grid(row=0, column=0, sticky=tk.NS, padx=(0, 8), pady=4)
+        canvas_panel = self._panel(main)
+        canvas_panel.grid(row=0, column=1, sticky=tk.NSEW, pady=4)
+        canvas_panel.rowconfigure(1, weight=1)
+        canvas_panel.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            tools_panel,
+            text="Passage Layout",
+            style="Section.TLabel",
+        ).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Button(
+            tools_panel,
+            text="Load Image",
+            command=self.load_layout_image,
+            style="Accent.TButton",
+        ).pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(
+            tools_panel,
+            text="Clear Image",
+            command=self.clear_layout_image,
+        ).pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(
+            tools_panel,
+            text="Reset Node Positions",
+            command=self.reset_layout_positions,
+        ).pack(fill=tk.X, pady=(0, 16))
+
+        self.layout_image_label = ttk.Label(
+            tools_panel,
+            text="No image loaded",
+            style="Header.TLabel",
+            wraplength=230,
+        )
+        self.layout_image_label.pack(anchor=tk.W, fill=tk.X, pady=(0, 16))
+
+        ttk.Label(
+            tools_panel,
+            text=(
+                "Stage 1 displays the current node-edge network on top of an "
+                "imported blade passage image. Node/edge editing remains in "
+                "the table tabs for now."
+            ),
+            style="Header.TLabel",
+            wraplength=230,
+        ).pack(anchor=tk.W, fill=tk.X)
+
+        ttk.Label(
+            canvas_panel,
+            text="Network Overlay",
+            style="Section.TLabel",
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
+        self.layout_canvas = tk.Canvas(
+            canvas_panel,
+            bg="#eef3f8",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+        )
+        self.layout_canvas.grid(row=1, column=0, sticky=tk.NSEW)
+        self.layout_canvas.bind(
+            "<Configure>",
+            lambda _event: self._redraw_layout_canvas(),
+        )
+
+    def load_layout_image(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Load passage image",
+            filetypes=IMAGE_FILETYPES,
+        )
+        if not path:
+            return
+        try:
+            self._set_layout_image(Path(path))
+        except Exception as exc:
+            messagebox.showerror("Image load failed", str(exc))
+
+    def _set_layout_image(self, path: Path) -> None:
+        self.layout_image_path = path
+        self._layout_native_photo = None
+        self._layout_photo = None
+        if Image is not None:
+            self._layout_source_image = Image.open(path)
+        else:
+            if path.suffix.lower() in {".jpg", ".jpeg"}:
+                raise RuntimeError(
+                    "JPEG layout images require Pillow. Install it with "
+                    "`pip install -r requirements.txt`, or use a PNG image."
+                )
+            self._layout_source_image = None
+            self._layout_native_photo = tk.PhotoImage(file=str(path))
+        self.layout_image_label.configure(text=f"Image: {path.name}")
+        self._redraw_layout_canvas()
+
+    def clear_layout_image(self) -> None:
+        self.layout_image_path = None
+        self._layout_source_image = None
+        self._layout_native_photo = None
+        self._layout_photo = None
+        self.layout_image_label.configure(text="No image loaded")
+        self._redraw_layout_canvas()
+
+    def reset_layout_positions(self) -> None:
+        self.node_positions.clear()
+        self._ensure_node_positions()
+        self._redraw_layout_canvas()
+
+    def _ensure_node_positions(self) -> None:
+        current_ids = [row["node_id"] for row in self.node_rows]
+        current_set = set(current_ids)
+        self.node_positions = {
+            node_id: position
+            for node_id, position in self.node_positions.items()
+            if node_id in current_set
+        }
+        auto_positions = _auto_node_positions(current_ids)
+        for node_id in current_ids:
+            self.node_positions.setdefault(
+                node_id,
+                DEFAULT_NODE_POSITIONS.get(node_id, auto_positions[node_id]),
+            )
+
+    def _redraw_layout_canvas(self) -> None:
+        if not hasattr(self, "layout_canvas"):
+            return
+        canvas = self.layout_canvas
+        canvas.delete(tk.ALL)
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+        self._draw_layout_background(canvas, width, height)
+        self._draw_layout_edges(canvas)
+        self._draw_layout_nodes(canvas)
+
+    def _draw_layout_background(
+        self,
+        canvas: tk.Canvas,
+        width: int,
+        height: int,
+    ) -> None:
+        margin = 18
+        if Image is not None and self._layout_source_image is not None:
+            source_width, source_height = self._layout_source_image.size
+            scale = min(
+                (width - 2 * margin) / source_width,
+                (height - 2 * margin) / source_height,
+            )
+            scale = max(scale, 0.05)
+            display_width = max(1, int(source_width * scale))
+            display_height = max(1, int(source_height * scale))
+            resized = self._layout_source_image.resize(
+                (display_width, display_height)
+            )
+            self._layout_photo = ImageTk.PhotoImage(resized)
+            x0 = (width - display_width) / 2
+            y0 = (height - display_height) / 2
+            canvas.create_image(x0, y0, anchor=tk.NW, image=self._layout_photo)
+            self._layout_image_bbox = (x0, y0, display_width, display_height)
+            return
+
+        if self._layout_native_photo is not None:
+            display_width = self._layout_native_photo.width()
+            display_height = self._layout_native_photo.height()
+            x0 = max((width - display_width) / 2, margin)
+            y0 = max((height - display_height) / 2, margin)
+            canvas.create_image(
+                x0,
+                y0,
+                anchor=tk.NW,
+                image=self._layout_native_photo,
+            )
+            self._layout_image_bbox = (x0, y0, display_width, display_height)
+            return
+
+        x0, y0 = margin, margin
+        display_width = width - 2 * margin
+        display_height = height - 2 * margin
+        canvas.create_rectangle(
+            x0,
+            y0,
+            x0 + display_width,
+            y0 + display_height,
+            fill="#f8fbfd",
+            outline=BORDER_COLOR,
+            dash=(4, 3),
+        )
+        canvas.create_text(
+            width / 2,
+            height / 2,
+            text="Load a turbine internal-passage image to view the overlay.",
+            fill=MUTED_COLOR,
+            font=("Segoe UI", 13, "bold"),
+            width=max(display_width - 40, 100),
+            justify=tk.CENTER,
+        )
+        self._layout_image_bbox = (x0, y0, display_width, display_height)
+
+    def _draw_layout_edges(self, canvas: tk.Canvas) -> None:
+        for row in self.edge_rows:
+            from_pos = self.node_positions.get(row["from_node"])
+            to_pos = self.node_positions.get(row["to_node"])
+            if from_pos is None or to_pos is None:
+                continue
+            x1, y1 = self._layout_to_canvas(from_pos)
+            x2, y2 = self._layout_to_canvas(to_pos)
+            canvas.create_line(
+                x1,
+                y1,
+                x2,
+                y2,
+                fill=ACCENT_COLOR,
+                width=3,
+                arrow=tk.LAST,
+                arrowshape=(14, 16, 6),
+            )
+            mid_x = (x1 + x2) / 2
+            mid_y = (y1 + y2) / 2
+            canvas.create_rectangle(
+                mid_x - 28,
+                mid_y - 12,
+                mid_x + 28,
+                mid_y + 12,
+                fill="#ffffff",
+                outline=BORDER_COLOR,
+            )
+            canvas.create_text(
+                mid_x,
+                mid_y,
+                text=row["cooling_technology"],
+                fill=TEXT_COLOR,
+                font=("Segoe UI", 8, "bold"),
+            )
+
+    def _draw_layout_nodes(self, canvas: tk.Canvas) -> None:
+        for row in self.node_rows:
+            node_id = row["node_id"]
+            position = self.node_positions.get(node_id)
+            if position is None:
+                continue
+            x, y = self._layout_to_canvas(position)
+            radius = 15 if row["kind"] != "inlet" else 17
+            fill = "#ffffff"
+            outline = ACCENT_COLOR
+            if row["kind"] == "inlet":
+                outline = SAFE_COLOR
+            elif row["kind"] == "merge":
+                outline = WARNING_COLOR
+            elif row["kind"] == "outlet":
+                outline = DANGER_COLOR
+            canvas.create_oval(
+                x - radius,
+                y - radius,
+                x + radius,
+                y + radius,
+                fill=fill,
+                outline=outline,
+                width=3,
+            )
+            canvas.create_text(
+                x,
+                y,
+                text=node_id,
+                fill=TEXT_COLOR,
+                font=("Segoe UI", 11, "bold"),
+            )
+
+    def _layout_to_canvas(self, position: tuple[float, float]) -> tuple[float, float]:
+        x0, y0, width, height = self._layout_image_bbox
+        return x0 + position[0] * width, y0 + position[1] * height
 
     def _build_nodes_tab(self) -> None:
         pane = ttk.PanedWindow(self.nodes_tab, orient=tk.HORIZONTAL)
@@ -882,6 +1190,7 @@ class PassageApp(tk.Tk):
     def _load_network(self, network: NetworkSpec) -> None:
         self.node_rows = [_node_to_row(node) for node in network.nodes]
         self.edge_rows = [_edge_to_row(edge) for edge in network.edges]
+        self._ensure_node_positions()
         self._refresh_node_tree()
         self._refresh_edge_tree()
         self._refresh_node_combos()
@@ -932,6 +1241,7 @@ class PassageApp(tk.Tk):
                 ),
             )
         self._refresh_dashboard_map()
+        self._redraw_layout_canvas()
 
     def _refresh_dashboard_map(self) -> None:
         if not hasattr(self, "dashboard_map_tree"):
@@ -998,11 +1308,14 @@ class PassageApp(tk.Tk):
             return
         self.node_rows[index] = row
         if row["node_id"] != old_id:
+            if old_id in self.node_positions:
+                self.node_positions[row["node_id"]] = self.node_positions.pop(old_id)
             for edge in self.edge_rows:
                 if edge["from_node"] == old_id:
                     edge["from_node"] = row["node_id"]
                 if edge["to_node"] == old_id:
                     edge["to_node"] = row["node_id"]
+        self._ensure_node_positions()
         self._refresh_node_tree()
         self._refresh_edge_tree()
         self._refresh_node_combos()
@@ -1021,9 +1334,11 @@ class PassageApp(tk.Tk):
                 "inlet_pressure": "",
             }
         )
+        self._ensure_node_positions()
         self._refresh_node_tree()
         self._refresh_node_combos()
         self._update_dashboard_summary()
+        self._redraw_layout_canvas()
         index = len(self.node_rows) - 1
         self.node_tree.selection_set(str(index))
         self._populate_node_form(index)
@@ -1044,9 +1359,12 @@ class PassageApp(tk.Tk):
             )
             return
         del self.node_rows[index]
+        self.node_positions.pop(node_id, None)
+        self._ensure_node_positions()
         self._refresh_node_tree()
         self._refresh_node_combos()
         self._update_dashboard_summary()
+        self._redraw_layout_canvas()
 
     def apply_edge(self) -> None:
         index = self._selected_index(self.edge_tree)
@@ -1122,19 +1440,38 @@ class PassageApp(tk.Tk):
     def calculate(self, show_success: bool = True) -> None:
         try:
             network = self._build_network_from_rows()
+            property_model = self.property_model.get()
             result = FixedFlowSolver(
                 network,
-                SolverOptions(property_model=self.property_model.get()),
+                SolverOptions(property_model=property_model),
             ).solve()
-        except Exception as exc:
-            self.last_result = None
-            self._show_dashboard_empty()
-            self._set_dashboard_status("FAILED", DANGER_COLOR, "#fde7ea")
-            self._set_dashboard_warning_text([f"Calculation failed: {exc}"])
-            self._show_warnings([f"Calculation failed: {exc}"])
-            self.notebook.select(self.warnings_tab)
+        except RuntimeError as exc:
+            if self.property_model.get() != "coolprop" or "CoolProp" not in str(exc):
+                self._handle_calculation_error(exc, show_success)
+                return
+            fallback_warning = (
+                "CoolProp is not installed. Ideal gas property model was used "
+                "instead."
+            )
+            self.property_model.set("ideal_gas")
+            try:
+                result = FixedFlowSolver(
+                    network,
+                    SolverOptions(property_model="ideal_gas"),
+                ).solve()
+                result = SolverResult(
+                    nodes=result.nodes,
+                    edges=result.edges,
+                    warnings=(fallback_warning, *result.warnings),
+                    reference_temperature=result.reference_temperature,
+                )
+            except Exception as fallback_exc:
+                self._handle_calculation_error(fallback_exc, show_success)
+                return
             if show_success:
-                messagebox.showerror("Calculation failed", str(exc))
+                messagebox.showwarning("CoolProp unavailable", fallback_warning)
+        except Exception as exc:
+            self._handle_calculation_error(exc, show_success)
             return
 
         self.last_result = result
@@ -1143,6 +1480,20 @@ class PassageApp(tk.Tk):
         self._show_warnings(result.warnings)
         if show_success:
             self.notebook.select(self.dashboard_tab)
+
+    def _handle_calculation_error(
+        self,
+        exc: Exception,
+        show_success: bool,
+    ) -> None:
+        self.last_result = None
+        self._show_dashboard_empty()
+        self._set_dashboard_status("FAILED", DANGER_COLOR, "#fde7ea")
+        self._set_dashboard_warning_text([f"Calculation failed: {exc}"])
+        self._show_warnings([f"Calculation failed: {exc}"])
+        self.notebook.select(self.warnings_tab)
+        if show_success:
+            messagebox.showerror("Calculation failed", str(exc))
 
     def _build_network_from_rows(self) -> NetworkSpec:
         nodes = [
@@ -1458,6 +1809,24 @@ def _params_from_row(row: dict[str, str]) -> dict[str, Any]:
         if value:
             params[spec.key] = _parse_value(value)
     return params
+
+
+def _auto_node_positions(node_ids: list[str]) -> dict[str, tuple[float, float]]:
+    if not node_ids:
+        return {}
+    if len(node_ids) == 1:
+        return {node_ids[0]: (0.5, 0.5)}
+
+    positions: dict[str, tuple[float, float]] = {}
+    x_min, x_max = 0.18, 0.82
+    y_min, y_max = 0.18, 0.82
+    for index, node_id in enumerate(node_ids):
+        fraction = index / (len(node_ids) - 1)
+        positions[node_id] = (
+            x_min + (x_max - x_min) * fraction,
+            y_max - (y_max - y_min) * fraction,
+        )
+    return positions
 
 
 def _format_params(params: dict[str, Any]) -> str:

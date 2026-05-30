@@ -10,8 +10,9 @@ internal-passage-gui = "internal_passage_1d.gui:main"
 
 [project.optional-dependencies]
 coolprop = ["CoolProp>=6.6"]
+image = ["Pillow>=10.0"]
 streamlit = ["streamlit>=1.35"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "Pillow>=10.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

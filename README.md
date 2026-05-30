@@ -42,6 +42,22 @@ a node or edge, edit its values, click `Apply`, then click `Calculate`. In the
 parameters are shown. Full results are shown as node and edge tables, and
 warnings are collected in a separate tab.
 
+The `Passage Layout` tab can load a turbine internal-passage image and overlay
+the current node-edge network. This first layout version is for visual checking;
+node and edge editing still happens in the table tabs.
+
+## Install Optional Dependencies
+
+For development environments, install optional property/image dependencies with:
+
+```powershell
+pip install -r requirements.txt
+```
+
+`CoolProp` enables real-gas air properties. If the GUI is set to CoolProp but
+CoolProp is not available, the calculation automatically falls back to the
+ideal-gas property model and reports a warning.
+
 ## PyCharm workflow
 
 Open this repository folder in PyCharm:

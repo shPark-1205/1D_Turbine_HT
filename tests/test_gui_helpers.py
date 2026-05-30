@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from internal_passage_1d.gui import _edge_to_row, _params_from_row, _param_row_key, _parse_params
+from internal_passage_1d.gui import (
+    DEFAULT_NODE_POSITIONS,
+    _auto_node_positions,
+    _edge_to_row,
+    _params_from_row,
+    _param_row_key,
+    _parse_params,
+)
 from internal_passage_1d.sample_cases import build_default_network
 
 
@@ -57,6 +64,20 @@ class GuiHelperTest(unittest.TestCase):
         self.assertEqual(params["nu_multiplier_turn"], 1.4)
         self.assertEqual(params["k_turn"], 1.1)
         self.assertEqual(params["turn_style"], "sharp")
+
+    def test_default_node_positions_cover_sample_inlets(self) -> None:
+        self.assertIn("1-1", DEFAULT_NODE_POSITIONS)
+        self.assertIn("1-2", DEFAULT_NODE_POSITIONS)
+
+    def test_auto_node_positions_are_normalized(self) -> None:
+        positions = _auto_node_positions(["A", "B", "C"])
+
+        self.assertEqual(set(positions), {"A", "B", "C"})
+        for x_pos, y_pos in positions.values():
+            self.assertGreaterEqual(x_pos, 0.0)
+            self.assertLessEqual(x_pos, 1.0)
+            self.assertGreaterEqual(y_pos, 0.0)
+            self.assertLessEqual(y_pos, 1.0)
 
 
 if __name__ == "__main__":
