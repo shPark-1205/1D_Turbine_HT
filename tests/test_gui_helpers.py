@@ -45,27 +45,17 @@ class GuiHelperTest(unittest.TestCase):
 
     def test_params_from_row_merges_visible_fields_and_extra_params(self) -> None:
         row = {
-            "cooling_technology": "u_turn",
-            "params_text": "custom_loss = 3.2\nturn_style = rounded",
-            _param_row_key("nu_multiplier_turn"): "1.4",
-            _param_row_key("k_turn"): "1.1",
-            _param_row_key("user_K_loss"): "",
+            "cooling_technology": "turning",
+            "params_text": "custom_loss = 3.2",
+            _param_row_key("c_nu"): "1.4",
             _param_row_key("turn_angle_deg"): "180",
-            _param_row_key("bend_radius_m"): "0.012",
-            _param_row_key("turn_style"): "sharp",
-            _param_row_key("turn_clearance_m"): "",
-            _param_row_key("upstream_width_m"): "",
-            _param_row_key("upstream_height_m"): "",
-            _param_row_key("downstream_width_m"): "",
-            _param_row_key("downstream_height_m"): "",
         }
 
         params = _params_from_row(row)
 
         self.assertEqual(params["custom_loss"], 3.2)
-        self.assertEqual(params["nu_multiplier_turn"], 1.4)
-        self.assertEqual(params["k_turn"], 1.1)
-        self.assertEqual(params["turn_style"], "sharp")
+        self.assertEqual(params["c_nu"], 1.4)
+        self.assertEqual(params["turn_angle_deg"], 180)
 
     def test_default_node_positions_cover_sample_inlets(self) -> None:
         self.assertIn("1-1", DEFAULT_NODE_POSITIONS)

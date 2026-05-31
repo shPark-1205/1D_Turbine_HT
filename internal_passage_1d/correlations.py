@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import floor, isfinite, pi, sin, sqrt
+from math import floor, isfinite, log, pi, sin, sqrt
 from typing import Any
 
 from .models import EdgeResult, EdgeSpec, NodeResult, SolverOptions
@@ -53,8 +53,8 @@ def evaluate_edge(
         ht = _smooth(edge, mass_flow, properties)
     elif edge.cooling_technology == "rib":
         ht = _rib(edge, mass_flow, properties)
-    elif edge.cooling_technology == "u_turn":
-        ht = _u_turn(edge, mass_flow, properties)
+    elif edge.cooling_technology in {"turning", "u_turn"}:
+        ht = _turning(edge, mass_flow, properties)
     elif edge.cooling_technology == "pin_fin":
         ht = _pin_fin(edge, mass_flow, properties)
     else:
@@ -79,14 +79,14 @@ def evaluate_edge(
 
     dynamic_head = 0.5 * properties.rho * ht.velocity**2
     dh = edge.geometry.hydraulic_diameter()
+    dp_length_scale = float(ht.intermediate.get("pressure_loss_diameter_m", dh))
     dp_friction = (
         ht.friction_factor_darcy
-        * (edge.geometry.length / dh)
+        * (edge.geometry.length / dp_length_scale)
         * dynamic_head
     )
-    k_loss = _total_k_loss(edge)
-    dp_minor = k_loss * dynamic_head
-    dp_total = dp_friction + dp_minor
+    dp_rotation = _rotation_pressure_loss(edge, properties)
+    dp_total = dp_friction + dp_rotation
     outlet_pressure = inlet.pressure - dp_total
 
     mach = ht.velocity / speed_of_sound(properties)
@@ -106,9 +106,10 @@ def evaluate_edge(
         {
             "dynamic_head_pa": dynamic_head,
             "hydraulic_diameter_m": dh,
+            "pressure_loss_diameter_m": dp_length_scale,
             "flow_area_m2": edge.geometry.flow_area(),
             "wetted_perimeter_m": edge.geometry.wetted_perimeter(),
-            "k_loss_total": k_loss,
+            "dp_rotation_pa": dp_rotation,
             "mach": mach,
             "reference_temperature_k": reference_temperature,
         }
@@ -132,7 +133,8 @@ def evaluate_edge(
         heat_transfer_area=ht.heat_transfer_area,
         heat_rate=heat_rate,
         dp_friction=dp_friction,
-        dp_minor=dp_minor,
+        dp_rotation=dp_rotation,
+        dp_minor=dp_rotation,
         dp_total=dp_total,
         properties=properties,
         warnings=tuple(warnings),
@@ -146,17 +148,17 @@ def _smooth(
     properties,
 ) -> _HeatTransferResult:
     geom = edge.geometry
-    parallel_passages = _parallel_passages(edge)
-    local_mass_flow = mass_flow / parallel_passages
     area = geom.flow_area()
     dh = geom.hydraulic_diameter()
-    velocity = local_mass_flow / (properties.rho * area)
+    velocity = mass_flow / (properties.rho * area)
     reynolds = properties.rho * velocity * dh / properties.mu
     warnings = _common_internal_flow_warnings(edge.edge_id, reynolds, geom.length, dh)
-    nusselt = 0.023 * reynolds**0.8 * properties.pr**0.3
+    nusselt_db = _dittus_boelter(reynolds, properties.pr)
+    c_nu = float(edge.params.get("c_nu", 1.0))
+    nusselt = c_nu * nusselt_db
     htc = nusselt * properties.k / dh
-    f_darcy = _darcy_friction(reynolds) * float(edge.params.get("user_f_multiplier", 1.0))
-    heat_area = geom.wetted_perimeter() * geom.length * parallel_passages
+    f_darcy = _smooth_friction(reynolds)
+    heat_area = geom.wetted_perimeter() * geom.length
     return _HeatTransferResult(
         reynolds=reynolds,
         nusselt=nusselt,
@@ -167,8 +169,8 @@ def _smooth(
         warnings=tuple(warnings),
         intermediate={
             "correlation": "Dittus-Boelter",
-            "parallel_passages": parallel_passages,
-            "local_mass_flow_kg_s": local_mass_flow,
+            "nusselt_db": nusselt_db,
+            "c_nu": c_nu,
         },
     )
 
@@ -179,11 +181,9 @@ def _rib(
     properties,
 ) -> _HeatTransferResult:
     geom = edge.geometry
-    parallel_passages = _parallel_passages(edge)
-    local_mass_flow = mass_flow / parallel_passages
     area = geom.flow_area()
     dh = geom.hydraulic_diameter()
-    velocity = local_mass_flow / (properties.rho * area)
+    velocity = mass_flow / (properties.rho * area)
     reynolds = properties.rho * velocity * dh / properties.mu
     warnings = _common_internal_flow_warnings(edge.edge_id, reynolds, geom.length, dh)
 
@@ -194,43 +194,49 @@ def _rib(
     aspect_ratio = geom.aspect_ratio()
     if aspect_ratio is None:
         raise ValueError(f"{edge.edge_id}: rib correlation needs rectangular geometry.")
+    width = geom._require_positive(geom.width, "width")
+    height = geom._require_positive(geom.height, "height")
+    aspect_ratio_used = min(aspect_ratio, 2.0)
+    m_exp = 0.0 if abs(angle_deg - 90.0) < 1e-9 else 0.35
     if not (30.0 <= angle_deg <= 90.0):
         warnings.append(
             f"{edge.edge_id}: rib angle is outside the usual 30-90 deg range."
         )
+    if aspect_ratio > 2.0:
+        warnings.append(f"{edge.edge_id}: rib AR={aspect_ratio:.3g}; AR=2 was used.")
 
-    f_darcy_smooth = _darcy_friction(reynolds)
-    f_darcy = f_darcy_smooth * float(p.get("user_f_multiplier", 1.0))
-    f_fanning = f_darcy / 4.0
-    e_plus = e_over_dh * reynolds * sqrt(max(f_fanning / 2.0, 1e-30))
-    r_e_plus = (
-        (p_over_e / 10.0) ** 0.35
-        * aspect_ratio**0.35
-        * (
-            12.31
-            - 27.07 * (angle_deg / 90.0)
-            + 17.86 * (angle_deg / 90.0) ** 2
-        )
+    f_darcy, e_plus, r_e_plus, converged, iterations = _solve_rib_friction(
+        edge_id=edge.edge_id,
+        reynolds=reynolds,
+        e_over_dh=e_over_dh,
+        p_over_e=p_over_e,
+        angle_deg=angle_deg,
+        width=width,
+        height=height,
+        aspect_ratio_used=aspect_ratio_used,
+        m_exp=m_exp,
     )
+    if not converged:
+        warnings.append(
+            f"{edge.edge_id}: rib friction iteration did not converge; last value was used."
+        )
     g_e_plus = (
         2.24
-        * aspect_ratio**0.1
-        * (angle_deg / 90.0) ** 0.35
+        * aspect_ratio_used**0.1
+        * (angle_deg / 90.0) ** m_exp
         * (p_over_e / 10.0) ** 0.1
         * e_plus**0.35
     )
-    denominator = (g_e_plus - r_e_plus) * sqrt(max(f_fanning / 2.0, 1e-30)) + 1.0
+    denominator = (g_e_plus - r_e_plus) * sqrt(max(f_darcy / 2.0, 1e-30)) + 1.0
     if denominator <= 0.0:
         warnings.append(
             f"{edge.edge_id}: rib Stanton denominator <= 0; clipped for prototype."
         )
         denominator = 1e-12
-    stanton = (f_fanning / 2.0) / denominator
+    stanton = (f_darcy / 2.0) / denominator
     htc = stanton * properties.cp * properties.rho * velocity
     nusselt = htc * dh / properties.k
-    heat_area = (
-        geom.wetted_perimeter() * geom.length + _rib_extra_area(edge, dh)
-    ) * parallel_passages
+    heat_area = geom.wetted_perimeter() * geom.length + _rib_extra_area(edge, dh)
 
     return _HeatTransferResult(
         reynolds=reynolds,
@@ -246,50 +252,53 @@ def _rib(
             "r_e_plus": r_e_plus,
             "g_e_plus": g_e_plus,
             "stanton": stanton,
-            "fanning_friction_factor": f_fanning,
             "e_over_dh": e_over_dh,
             "p_over_e": p_over_e,
             "angle_deg": angle_deg,
             "aspect_ratio": aspect_ratio,
-            "parallel_passages": parallel_passages,
-            "local_mass_flow_kg_s": local_mass_flow,
+            "aspect_ratio_used": aspect_ratio_used,
+            "m_exponent": m_exp,
+            "rib_friction_iterations": iterations,
+            "rib_friction_converged": converged,
         },
     )
 
 
-def _u_turn(
+def _turning(
     edge: EdgeSpec,
     mass_flow: float,
     properties,
 ) -> _HeatTransferResult:
-    base = _smooth(edge, mass_flow, properties)
-    multiplier = float(edge.params.get("nu_multiplier_turn", 1.0))
-    nusselt = base.nusselt * multiplier
-    htc = base.htc * multiplier
-    intermediate = dict(base.intermediate)
-    intermediate.update(
-        {
-            "correlation": "U-turn placeholder",
-            "nu_multiplier_turn": multiplier,
-            "turn_angle_deg": edge.params.get("turn_angle_deg"),
-            "bend_radius_m": edge.params.get("bend_radius_m"),
-            "turn_style": edge.params.get("turn_style"),
-            "turn_clearance_m": edge.params.get("turn_clearance_m"),
-            "upstream_width_m": edge.params.get("upstream_width_m"),
-            "upstream_height_m": edge.params.get("upstream_height_m"),
-            "downstream_width_m": edge.params.get("downstream_width_m"),
-            "downstream_height_m": edge.params.get("downstream_height_m"),
-        }
-    )
+    geom = edge.geometry
+    area = geom.flow_area()
+    dh = geom.hydraulic_diameter()
+    velocity = mass_flow / (properties.rho * area)
+    reynolds = properties.rho * velocity * dh / properties.mu
+    warnings = _common_internal_flow_warnings(edge.edge_id, reynolds, geom.length, dh)
+    c_nu = float(edge.params.get("c_nu", edge.params.get("nu_multiplier_turn", 1.5)))
+    nusselt_db = _dittus_boelter(reynolds, properties.pr)
+    nusselt = c_nu * nusselt_db
+    htc = nusselt * properties.k / dh
+    f_darcy = 3.0 * _smooth_friction(reynolds)
+    turn_angle = float(edge.params.get("turn_angle_deg", 180.0))
+    if not (0.0 < turn_angle <= 180.0):
+        warnings.append(f"{edge.edge_id}: turn angle should be between 0 and 180 deg.")
+
     return _HeatTransferResult(
-        reynolds=base.reynolds,
+        reynolds=reynolds,
         nusselt=nusselt,
         htc=htc,
-        friction_factor_darcy=base.friction_factor_darcy,
-        velocity=base.velocity,
-        heat_transfer_area=base.heat_transfer_area,
-        warnings=base.warnings,
-        intermediate=intermediate,
+        friction_factor_darcy=f_darcy,
+        velocity=velocity,
+        heat_transfer_area=geom.wetted_perimeter() * geom.length,
+        warnings=tuple(warnings),
+        intermediate={
+            "correlation": "Turning: 3 x smooth-channel friction, C_Nu x Dittus-Boelter",
+            "nusselt_db": nusselt_db,
+            "c_nu": c_nu,
+            "turn_angle_deg": turn_angle,
+            "smooth_friction_factor": f_darcy / 3.0,
+        },
     )
 
 
@@ -302,8 +311,6 @@ def _pin_fin(
     if geom.shape != "rectangular":
         raise ValueError(f"{edge.edge_id}: pin-fin correlation needs rectangular geometry.")
 
-    parallel_passages = _parallel_passages(edge)
-    local_mass_flow = mass_flow / parallel_passages
     p = edge.params
     pin_diameter = _positive_param(p, "pin_diameter", edge.edge_id)
     pin_height = _positive_param(p, "pin_height", edge.edge_id)
@@ -311,14 +318,17 @@ def _pin_fin(
     pitch_s = _positive_param(p, "pitch_s", edge.edge_id)
     width = geom._require_positive(geom.width, "width")
     height = geom._require_positive(geom.height, "height")
-    row_count = int(p.get("row_count") or max(1, floor(geom.length / pitch_x)))
-    pins_cross = int(p.get("pins_cross") or max(1, floor(width / pitch_s)))
+    row_count = max(1, floor(geom.length / pitch_x))
+    pins_cross = max(1, floor(width / pitch_s))
     total_pins = int(p.get("total_pins") or row_count * pins_cross)
 
-    open_width = max(width - pins_cross * pin_diameter, 1e-9)
-    blocked_height = min(pin_height, height)
-    min_area = max(open_width * blocked_height, 1e-12)
-    velocity_max = local_mass_flow / (properties.rho * min_area)
+    pin_projected_area = pins_cross * pin_diameter * min(pin_height, height)
+    min_area = width * height - pin_projected_area
+    if min_area <= 0.0:
+        raise ValueError(
+            f"{edge.edge_id}: pin-fin blockage leaves no positive flow area."
+        )
+    velocity_max = mass_flow / (properties.rho * min_area)
     reynolds = properties.rho * velocity_max * pin_diameter / properties.mu
     x_over_d = pitch_x / pin_diameter
     s_over_d = pitch_s / pin_diameter
@@ -335,24 +345,24 @@ def _pin_fin(
     if not (2_000.0 < reynolds < 100_000.0):
         warnings.append(f"{edge.edge_id}: pin Reynolds is outside 2,000-100,000.")
 
-    nusselt = 0.135 * reynolds**0.69 * x_over_d**-0.34
+    nusselt = 0.135 * reynolds**0.69 * s_over_d**-0.34
     htc = nusselt * properties.k / pin_diameter
-    dh = geom.hydraulic_diameter()
     bulk_area = geom.flow_area()
-    bulk_velocity = local_mass_flow / (properties.rho * bulk_area)
+    bulk_velocity = mass_flow / (properties.rho * bulk_area)
+    dh = geom.hydraulic_diameter()
     re_bulk = properties.rho * bulk_velocity * dh / properties.mu
-    f_darcy = _darcy_friction(re_bulk) * float(p.get("user_f_multiplier", 1.0))
+    f_darcy = 4.0 * 1.76 * reynolds**-0.318
     base_area = geom.wetted_perimeter() * geom.length
     lateral_area = total_pins * pi * pin_diameter * pin_height
     tip_area = total_pins * pi * pin_diameter**2 / 4.0
-    heat_area = (base_area + lateral_area + tip_area) * parallel_passages
+    heat_area = base_area + lateral_area + tip_area
 
     return _HeatTransferResult(
         reynolds=reynolds,
         nusselt=nusselt,
         htc=htc,
         friction_factor_darcy=f_darcy,
-        velocity=bulk_velocity,
+        velocity=velocity_max,
         heat_transfer_area=heat_area,
         warnings=tuple(warnings),
         intermediate={
@@ -361,6 +371,8 @@ def _pin_fin(
             "bulk_velocity_m_s": bulk_velocity,
             "v_max_m_s": velocity_max,
             "min_flow_area_m2": min_area,
+            "pin_projected_area_m2": pin_projected_area,
+            "pressure_loss_diameter_m": pin_diameter,
             "pin_diameter_m": pin_diameter,
             "pin_height_m": pin_height,
             "pitch_x_m": pitch_x,
@@ -373,8 +385,6 @@ def _pin_fin(
             "total_pins": total_pins,
             "pin_lateral_area_m2": lateral_area,
             "pin_tip_area_m2": tip_area,
-            "parallel_passages": parallel_passages,
-            "local_mass_flow_kg_s": local_mass_flow,
         },
     )
 
@@ -411,17 +421,84 @@ def _heat_rate(
     raise ValueError(f"Unsupported wall mode: {wall.mode}")
 
 
-def _darcy_friction(reynolds: float) -> float:
+def _dittus_boelter(reynolds: float, prandtl: float) -> float:
+    return 0.023 * reynolds**0.8 * prandtl**0.3
+
+
+def _smooth_friction(reynolds: float) -> float:
     if reynolds <= 0.0 or not isfinite(reynolds):
         raise ValueError("Reynolds number must be finite and positive.")
-    if reynolds < 2300.0:
-        return 64.0 / reynolds
-    if reynolds < 4000.0:
-        laminar = 64.0 / reynolds
-        turbulent = 0.3164 * reynolds**-0.25
-        weight = (reynolds - 2300.0) / (4000.0 - 2300.0)
-        return (1.0 - weight) * laminar + weight * turbulent
-    return 0.3164 * reynolds**-0.25
+    denominator = 2.236 * log(reynolds) - 4.639
+    if denominator <= 0.0:
+        raise ValueError(
+            "Smooth-channel friction correlation denominator must be positive."
+        )
+    return 2.0 * denominator**-2.0
+
+
+def _solve_rib_friction(
+    edge_id: str,
+    reynolds: float,
+    e_over_dh: float,
+    p_over_e: float,
+    angle_deg: float,
+    width: float,
+    height: float,
+    aspect_ratio_used: float,
+    m_exp: float,
+) -> tuple[float, float, float, bool, int]:
+    friction = _smooth_friction(reynolds)
+    r_e_plus = 0.0
+    e_plus = 0.0
+    for iteration in range(1, 61):
+        e_plus = e_over_dh * reynolds * sqrt(max(friction / 2.0, 1e-30))
+        r_e_plus = _rib_roughness_function(
+            p_over_e=p_over_e,
+            aspect_ratio_used=aspect_ratio_used,
+            angle_deg=angle_deg,
+            m_exp=m_exp,
+        )
+        log_argument = (2.0 * e_over_dh) * (2.0 * width / (width + height))
+        if log_argument <= 0.0:
+            raise ValueError(f"{edge_id}: rib friction log argument must be positive.")
+        bracket = r_e_plus - 2.5 * log(log_argument) - 2.5
+        if abs(bracket) < 1e-12:
+            raise ValueError(f"{edge_id}: rib friction denominator is near zero.")
+        next_friction = 0.5 * bracket**-2.0
+        relaxed = 0.5 * friction + 0.5 * next_friction
+        if abs(relaxed - friction) <= max(1e-9, 1e-6 * abs(friction)):
+            friction = relaxed
+            e_plus = e_over_dh * reynolds * sqrt(max(friction / 2.0, 1e-30))
+            return friction, e_plus, r_e_plus, True, iteration
+        friction = relaxed
+    e_plus = e_over_dh * reynolds * sqrt(max(friction / 2.0, 1e-30))
+    return friction, e_plus, r_e_plus, False, 60
+
+
+def _rib_roughness_function(
+    p_over_e: float,
+    aspect_ratio_used: float,
+    angle_deg: float,
+    m_exp: float,
+) -> float:
+    angle_ratio = angle_deg / 90.0
+    return (
+        (p_over_e / 10.0) ** 0.35
+        * aspect_ratio_used**m_exp
+        * (12.31 - 27.07 * angle_ratio + 17.86 * angle_ratio**2)
+    )
+
+
+def _rotation_pressure_loss(edge: EdgeSpec, properties) -> float:
+    if edge.cooling_technology != "rib":
+        return 0.0
+    radius = float(edge.params.get("radius_m", 1.23))
+    rpm = float(edge.params.get("rpm", 3000.0))
+    c_rotation = float(edge.params.get("c_rotation", 1.056))
+    if radius < 0.0 or rpm < 0.0 or c_rotation < 0.0:
+        raise ValueError(f"{edge.edge_id}: rotation parameters must be non-negative.")
+    rotation_speed = rpm * radius * pi / 60.0
+    return properties.rho * c_rotation * rotation_speed**2 * edge.geometry.length
 
 
 def _common_internal_flow_warnings(
@@ -449,13 +526,6 @@ def _positive_param(params: dict[str, Any], name: str, edge_id: str) -> float:
     return float(value)
 
 
-def _parallel_passages(edge: EdgeSpec) -> float:
-    value = float(edge.params.get("parallel_passages", 1.0))
-    if value <= 0.0:
-        raise ValueError(f"{edge.edge_id}: parallel_passages must be positive.")
-    return value
-
-
 def _rib_extra_area(edge: EdgeSpec, hydraulic_diameter: float) -> float:
     geom = edge.geometry
     params = edge.params
@@ -474,12 +544,3 @@ def _rib_extra_area(edge: EdgeSpec, hydraulic_diameter: float) -> float:
     rib_span = width / sin_angle
     exposed_area_per_rib = rib_span * (rib_width + 2.0 * rib_height)
     return ribbed_walls * rib_count * exposed_area_per_rib
-
-
-def _total_k_loss(edge: EdgeSpec) -> float:
-    params = edge.params
-    return (
-        float(params.get("user_K_loss", 0.0))
-        + float(params.get("k_loss", 0.0))
-        + float(params.get("k_turn", 0.0))
-    )

@@ -7,6 +7,7 @@ from .correlations import evaluate_edge
 from .models import (
     EdgeResult,
     EdgeSpec,
+    Geometry,
     NetworkSpec,
     NodeResult,
     NodeSpec,
@@ -72,9 +73,10 @@ class FixedFlowSolver:
             for edge in outgoing:
                 if edge.edge_id in edge_results:
                     continue
+                edge_for_eval = self._edge_for_evaluation(edge)
                 mass_flow = flow_map[edge.edge_id]
                 edge_result = evaluate_edge(
-                    edge=edge,
+                    edge=edge_for_eval,
                     inlet=node_result,
                     mass_flow=mass_flow,
                     property_provider=property_provider,
@@ -108,6 +110,44 @@ class FixedFlowSolver:
             warnings=tuple(warnings),
             reference_temperature=reference_temperature,
         )
+
+    def _edge_for_evaluation(self, edge: EdgeSpec) -> EdgeSpec:
+        if edge.cooling_technology not in {"turning", "u_turn"}:
+            return edge
+        if edge.geometry.shape != "rectangular":
+            return edge
+        width, height = self._turning_neighbor_size(edge)
+        if width is None or height is None:
+            return edge
+        geometry = Geometry(
+            length=edge.geometry.length,
+            shape="rectangular",
+            width=width,
+            height=height,
+            diameter=edge.geometry.diameter,
+        )
+        return replace(edge, geometry=geometry, cooling_technology="turning")
+
+    def _turning_neighbor_size(self, edge: EdgeSpec) -> tuple[float | None, float | None]:
+        width_values: list[float] = []
+        height_values: list[float] = []
+        for adjacent in (
+            *self._incoming.get(edge.from_node, []),
+            *self._outgoing.get(edge.to_node, []),
+        ):
+            if adjacent.edge_id == edge.edge_id or adjacent.geometry.shape != "rectangular":
+                continue
+            if adjacent.geometry.width is not None:
+                width_values.append(adjacent.geometry.width)
+            if adjacent.geometry.height is not None:
+                height_values.append(adjacent.geometry.height)
+        width = sum(width_values) / len(width_values) if width_values else edge.geometry.width
+        height = (
+            sum(height_values) / len(height_values)
+            if height_values
+            else edge.geometry.height
+        )
+        return width, height
 
     def _global_reference_temperature(self) -> float:
         numerator = 0.0

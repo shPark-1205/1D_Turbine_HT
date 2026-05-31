@@ -13,10 +13,9 @@ The first version focuses on:
 - edge-based geometry and cooling technology inputs
 - ideal-gas air properties by default
 - optional CoolProp air properties when CoolProp is installed
-- smooth, rib, U-turn, and pin-fin placeholder correlations
-- user friction multipliers and user K-loss inputs
-- optional `parallel_passages` parameter for representative edges that model
-  multiple identical passages
+- smooth, rib, turning, and pin-fin correlations
+- rib rotation pressure-loss correction
+- automatic pin-fin row/across-count calculation from channel and pitch geometry
 
 ## Run the example
 
@@ -42,8 +41,9 @@ select nodes or edges directly on the image. Node and edge editors are shown on
 the right side of the same screen. Use `Add Node` to place a node by clicking on
 the image, and `Connect Nodes` to create an edge by clicking a source node and a
 target node. The `Technology` field controls which cooling-technology
-parameters are shown. Full calculation results and warnings remain available in
-separate result tabs.
+parameters are shown. The `Correlations` tab summarizes the pressure-drop and
+heat-transfer equations used by the current prototype. Full calculation results
+and warnings remain available in separate result tabs.
 
 ## Install Optional Dependencies
 
@@ -101,12 +101,10 @@ python -m unittest discover -s tests
   the known flow paths but does not yet solve branch flow from pressure balance.
 - Merge pressure consistency is reported as a warning when incoming branch
   pressures differ.
-- U-turn pressure loss is represented by user K-loss values and a Nusselt
-  multiplier.
-- Rib and pin-fin formulas are implemented as replaceable modules. Their
-  pressure-drop models are intentionally simple until project-specific
-  correlations are added.
-- When an edge represents several identical parallel passages, set
-  `parallel_passages` so local velocity and pressure loss are evaluated per
-  passage while heat-transfer area is scaled by the passage count.
+- Turning edges use `f_turning = 3 * f_smooth` and `Nu = C_Nu * Nu_DB` until a
+  project-specific turn correlation is selected.
+- Rib friction is solved iteratively because `e+` depends on the rib friction
+  factor.
+- Pin-fin row count and pins across the channel are calculated from channel
+  length, channel width, and pin pitch.
 - Internal calculations are SI.

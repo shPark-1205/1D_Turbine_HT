@@ -8,7 +8,7 @@ from typing import Any, Literal
 NodeKind = Literal["inlet", "internal", "merge", "split", "outlet"]
 WallMode = Literal["adiabatic", "wall_temperature", "heat_flux"]
 GeometryShape = Literal["rectangular", "circular"]
-CoolingTechnology = Literal["smooth", "rib", "u_turn", "pin_fin"]
+CoolingTechnology = Literal["smooth", "rib", "turning", "pin_fin"]
 PropertyModel = Literal["ideal_gas", "coolprop"]
 
 
@@ -149,6 +149,7 @@ class EdgeResult:
     heat_transfer_area: float
     heat_rate: float
     dp_friction: float
+    dp_rotation: float
     dp_minor: float
     dp_total: float
     properties: AirProperties

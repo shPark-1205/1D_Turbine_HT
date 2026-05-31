@@ -26,7 +26,7 @@ from .sample_cases import build_default_network
 
 
 NODE_KINDS = ("inlet", "internal", "merge", "split", "outlet")
-TECHNOLOGIES = ("smooth", "rib", "u_turn", "pin_fin")
+TECHNOLOGIES = ("smooth", "rib", "turning", "pin_fin")
 SHAPES = ("rectangular", "circular")
 WALL_MODES = ("adiabatic", "wall_temperature", "heat_flux")
 PROPERTY_MODELS = ("ideal_gas", "coolprop")
@@ -66,44 +66,26 @@ class ParamSpec(NamedTuple):
 
 TECH_PARAM_SPECS: dict[str, tuple[ParamSpec, ...]] = {
     "smooth": (
-        ParamSpec("parallel_passages", "Parallel passages [-]", "1"),
-        ParamSpec("user_f_multiplier", "Friction multiplier [-]", "1"),
-        ParamSpec("user_K_loss", "Minor K loss [-]", "0"),
+        ParamSpec("c_nu", "C_Nu [-]", "1"),
     ),
     "rib": (
-        ParamSpec("parallel_passages", "Parallel passages [-]", "1"),
         ParamSpec("e_over_dh", "Rib e/Dh [-]"),
         ParamSpec("p_over_e", "Rib pitch/e [-]"),
         ParamSpec("angle_deg", "Rib angle [deg]", "45"),
-        ParamSpec("user_f_multiplier", "Friction multiplier [-]", "1"),
-        ParamSpec("user_K_loss", "Minor K loss [-]", "0"),
-        ParamSpec("rib_count", "Rib count"),
+        ParamSpec("radius_m", "Blade radius [m]", "1.23"),
+        ParamSpec("rpm", "Blade RPM", "3000"),
+        ParamSpec("c_rotation", "C_rotation [-]", "1.056"),
         ParamSpec("ribbed_walls", "Ribbed walls", "2"),
     ),
-    "u_turn": (
-        ParamSpec("parallel_passages", "Parallel passages [-]", "1"),
-        ParamSpec("nu_multiplier_turn", "Nu multiplier [-]", "1"),
-        ParamSpec("k_turn", "Turn K loss [-]", "0"),
-        ParamSpec("user_K_loss", "Additional K loss [-]", "0"),
+    "turning": (
+        ParamSpec("c_nu", "C_Nu [-]", "1.5"),
         ParamSpec("turn_angle_deg", "Turn angle [deg]", "180"),
-        ParamSpec("bend_radius_m", "Bend radius [m]"),
-        ParamSpec("turn_style", "Turn style", "sharp"),
-        ParamSpec("turn_clearance_m", "Turn clearance [m]"),
-        ParamSpec("upstream_width_m", "Upstream width [m]"),
-        ParamSpec("upstream_height_m", "Upstream height [m]"),
-        ParamSpec("downstream_width_m", "Downstream width [m]"),
-        ParamSpec("downstream_height_m", "Downstream height [m]"),
     ),
     "pin_fin": (
-        ParamSpec("parallel_passages", "Parallel passages [-]", "1"),
         ParamSpec("pin_diameter", "Pin diameter [m]"),
         ParamSpec("pin_height", "Pin height [m]"),
         ParamSpec("pitch_x", "Streamwise pitch X [m]"),
         ParamSpec("pitch_s", "Spanwise pitch S [m]"),
-        ParamSpec("row_count", "Row count"),
-        ParamSpec("pins_cross", "Pins across width"),
-        ParamSpec("user_f_multiplier", "Friction multiplier [-]", "1"),
-        ParamSpec("user_K_loss", "Minor K loss [-]", "0"),
     ),
 }
 ALL_PARAM_KEYS = tuple(
@@ -129,6 +111,7 @@ class PassageApp(tk.Tk):
         self.edge_rows: list[dict[str, str]] = []
         self.last_result: SolverResult | None = None
         self._syncing_edge_form = False
+        self._suppress_auto_apply = False
         self.node_positions: dict[str, tuple[float, float]] = {}
         self.layout_image_path: Path | None = None
         self._layout_source_image: Any = None
@@ -141,6 +124,7 @@ class PassageApp(tk.Tk):
         self._pending_edge_from: str | None = None
         self._drag_node_id: str | None = None
         self._drag_started = False
+        self._workspace_scroll_canvas: tk.Canvas | None = None
 
         self.property_model = tk.StringVar(value="ideal_gas")
         self.auto_calculate = tk.BooleanVar(value=False)
@@ -175,9 +159,13 @@ class PassageApp(tk.Tk):
 
         self._configure_style()
         self._build_widgets()
+        self._install_form_traces()
         self._edge_vars["cooling_technology"].trace_add(
             "write", self._on_technology_change
         )
+        self._edge_vars["shape"].trace_add("write", self._on_shape_change)
+        self._edge_vars["wall_mode"].trace_add("write", self._on_wall_mode_change)
+        self._node_vars["kind"].trace_add("write", self._on_node_kind_change)
         self.property_model.trace_add(
             "write", lambda *_args: self._update_dashboard_summary()
         )
@@ -317,7 +305,7 @@ class PassageApp(tk.Tk):
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Checkbutton(
             toolbar,
-            text="Auto calculate after Apply",
+            text="Auto calculate",
             variable=self.auto_calculate,
         ).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Label(toolbar, text="Property model", style="Header.TLabel").pack(
@@ -338,13 +326,16 @@ class PassageApp(tk.Tk):
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
         self.workspace_tab = ttk.Frame(self.notebook)
+        self.correlations_tab = ttk.Frame(self.notebook)
         self.results_tab = ttk.Frame(self.notebook)
         self.warnings_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.workspace_tab, text="Workspace")
+        self.notebook.add(self.correlations_tab, text="Correlations")
         self.notebook.add(self.results_tab, text="Results")
         self.notebook.add(self.warnings_tab, text="Warnings")
 
         self._build_workspace_tab()
+        self._build_correlations_tab()
         self._build_results_tab()
         self._build_warnings_tab()
 
@@ -443,6 +434,8 @@ class PassageApp(tk.Tk):
 
         right.bind("<Configure>", resize_scroll_region)
         right_canvas.bind("<Configure>", resize_form_width)
+        self._workspace_scroll_canvas = right_canvas
+        self.bind_all("<MouseWheel>", self._on_workspace_mousewheel, add="+")
 
         self._build_workspace_summary(right)
         self._build_workspace_node_editor(right)
@@ -526,36 +519,34 @@ class PassageApp(tk.Tk):
             state="readonly",
             width=20,
         ).grid(row=2, column=1, sticky=tk.EW, pady=3)
-        self._labeled_entry(
+        self.node_inlet_fields = []
+        self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
             3,
             "Inlet m_dot [kg/s]",
             self._node_vars["inlet_mdot"],
-        )
-        self._labeled_entry(
+        ))
+        self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
             4,
             "Inlet temperature [K]",
             self._node_vars["inlet_temperature"],
-        )
-        self._labeled_entry(
+        ))
+        self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
             5,
             "Inlet pressure [Pa]",
             self._node_vars["inlet_pressure"],
-        )
+        ))
         node_panel.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(node_panel, style="Panel.TFrame")
         buttons.grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
-        ttk.Button(buttons, text="Apply Node", command=self.apply_node).pack(
-            side=tk.LEFT
-        )
         ttk.Button(buttons, text="Add Node", command=self.add_node).pack(
-            side=tk.LEFT, padx=6
+            side=tk.LEFT
         )
         ttk.Button(buttons, text="Delete Node", command=self.delete_node).pack(
-            side=tk.LEFT
+            side=tk.LEFT, padx=6
         )
 
     def _build_workspace_edge_editor(self, parent: ttk.Frame) -> None:
@@ -583,24 +574,34 @@ class PassageApp(tk.Tk):
         row += 1
         self._labeled_combo(edge_panel, row, "Shape", self._edge_vars["shape"], SHAPES)
         row += 1
+        self.edge_geometry_fields = {}
         for label, key in (
             ("Length [m]", "length"),
             ("Width [m]", "width"),
             ("Height [m]", "height"),
             ("Diameter [m]", "diameter"),
         ):
-            self._labeled_entry(edge_panel, row, label, self._edge_vars[key])
+            self.edge_geometry_fields[key] = self._labeled_entry(
+                edge_panel,
+                row,
+                label,
+                self._edge_vars[key],
+            )
             row += 1
         self._labeled_combo(edge_panel, row, "Wall mode", self._edge_vars["wall_mode"], WALL_MODES)
         row += 1
+        self.edge_wall_fields = {}
         for label, key in (
             ("Wall T [K]", "wall_temperature"),
             ("Heat flux [W/m2]", "heat_flux"),
             ("External h [W/m2-K]", "external_htc"),
-            ("Flow fraction", "flow_fraction"),
-            ("Fixed m_dot [kg/s]", "fixed_mdot"),
         ):
-            self._labeled_entry(edge_panel, row, label, self._edge_vars[key])
+            self.edge_wall_fields[key] = self._labeled_entry(
+                edge_panel,
+                row,
+                label,
+                self._edge_vars[key],
+            )
             row += 1
 
         self.tech_param_frame = ttk.LabelFrame(
@@ -617,25 +618,20 @@ class PassageApp(tk.Tk):
         )
         row += 1
 
-        ttk.Label(edge_panel, text="Additional params", style="Header.TLabel").grid(
-            row=row, column=0, sticky=tk.NW, pady=3
-        )
-        self.params_text = tk.Text(edge_panel, height=4, width=32, wrap=tk.NONE)
-        self.params_text.grid(row=row, column=1, sticky=tk.NSEW, pady=3)
+        self.params_text = tk.Text(edge_panel, height=1, width=1, wrap=tk.NONE)
         row += 1
         edge_panel.columnconfigure(1, weight=1)
         self._render_tech_params("smooth")
+        self._update_shape_visibility()
+        self._update_wall_field_visibility()
 
         buttons = ttk.Frame(edge_panel, style="Panel.TFrame")
         buttons.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
-        ttk.Button(buttons, text="Apply Edge", command=self.apply_edge).pack(
-            side=tk.LEFT
-        )
         ttk.Button(buttons, text="Add Edge", command=self.add_edge).pack(
-            side=tk.LEFT, padx=6
+            side=tk.LEFT
         )
         ttk.Button(buttons, text="Delete Edge", command=self.delete_edge).pack(
-            side=tk.LEFT
+            side=tk.LEFT, padx=6
         )
 
     def _build_workspace_tables(self, parent: ttk.Frame) -> None:
@@ -660,9 +656,9 @@ class PassageApp(tk.Tk):
         node_headings = {
             "node_id": "Node",
             "kind": "Kind",
-            "mdot": "m_dot",
-            "temperature": "T",
-            "pressure": "P",
+            "mdot": "m_dot [kg/s]",
+            "temperature": "T [K]",
+            "pressure": "P [Pa]",
         }
         for column in node_columns:
             self.node_tree.heading(column, text=node_headings[column])
@@ -685,7 +681,7 @@ class PassageApp(tk.Tk):
             "edge_id": "Edge",
             "route": "Route",
             "tech": "Tech",
-            "length": "L",
+            "length": "L [m]",
         }
         for column in edge_columns:
             self.edge_tree.heading(column, text=edge_headings[column])
@@ -853,6 +849,22 @@ class PassageApp(tk.Tk):
             highlightthickness=1,
         )
 
+    def _on_workspace_mousewheel(self, event: tk.Event) -> None:
+        canvas = self._workspace_scroll_canvas
+        if canvas is None:
+            return
+        pointer_x = canvas.winfo_pointerx()
+        pointer_y = canvas.winfo_pointery()
+        left = canvas.winfo_rootx()
+        top = canvas.winfo_rooty()
+        right = left + canvas.winfo_width()
+        bottom = top + canvas.winfo_height()
+        if not (left <= pointer_x <= right and top <= pointer_y <= bottom):
+            return
+        delta = getattr(event, "delta", 0)
+        if delta:
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
     def _summary_row(
         self,
         parent: tk.Widget,
@@ -996,7 +1008,8 @@ class PassageApp(tk.Tk):
                 )
             self._layout_source_image = None
             self._layout_native_photo = tk.PhotoImage(file=str(path))
-        self.layout_image_label.configure(text=f"Image: {path.name}")
+        if hasattr(self, "layout_image_label"):
+            self.layout_image_label.configure(text=f"Image: {path.name}")
         self._redraw_layout_canvas()
 
     def clear_layout_image(self) -> None:
@@ -1004,7 +1017,8 @@ class PassageApp(tk.Tk):
         self._layout_source_image = None
         self._layout_native_photo = None
         self._layout_photo = None
-        self.layout_image_label.configure(text="No image loaded")
+        if hasattr(self, "layout_image_label"):
+            self.layout_image_label.configure(text="No image loaded")
         self._redraw_layout_canvas()
 
     def reset_layout_positions(self) -> None:
@@ -1350,9 +1364,24 @@ class PassageApp(tk.Tk):
         base_id = f"{from_node}_to_{to_node}".replace(" ", "_")
         edge_id = _unique_id(base_id, existing_ids)
         self.edge_rows.append(self._default_edge_row(edge_id, from_node, to_node))
+        self._convert_source_outlet_to_internal(from_node)
+        self._refresh_node_tree()
         self._refresh_edge_tree()
         self._update_dashboard_summary()
         self._select_edge_by_id(edge_id)
+
+    def _convert_source_outlet_to_internal(self, node_id: str) -> None:
+        for row in self.node_rows:
+            if row["node_id"] == node_id and row["kind"] == "outlet":
+                row["kind"] = "internal"
+                row["inlet_mdot"] = ""
+                row["inlet_temperature"] = ""
+                row["inlet_pressure"] = ""
+                if self.selected_node_id == node_id:
+                    index = self._node_index(node_id)
+                    if index is not None:
+                        self._populate_node_form(index)
+                return
 
     def _default_edge_row(
         self,
@@ -1583,6 +1612,118 @@ class PassageApp(tk.Tk):
             side=tk.LEFT
         )
 
+    def _build_correlations_tab(self) -> None:
+        canvas = tk.Canvas(self.correlations_tab, highlightthickness=0, bg=WINDOW_BG)
+        scroll = ttk.Scrollbar(
+            self.correlations_tab,
+            orient=tk.VERTICAL,
+            command=canvas.yview,
+        )
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        frame = ttk.Frame(canvas, padding=(4, 4, 12, 4))
+        window = canvas.create_window((0, 0), window=frame, anchor=tk.NW)
+
+        def resize_scroll_region(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox(tk.ALL))
+
+        def resize_width(event: tk.Event) -> None:
+            canvas.itemconfigure(window, width=event.width)
+
+        frame.bind("<Configure>", resize_scroll_region)
+        canvas.bind("<Configure>", resize_width)
+
+        self._formula_section(
+            frame,
+            "Pressure Update",
+            (
+                "P_out = P_in - P_loss_friction - P_loss_rotation\n"
+                "Smooth channel, turning, and pin-fin set P_loss_rotation = 0.\n"
+                "Dynamic pressure = 0.5 * rho * V^2."
+            ),
+        )
+        self._formula_section(
+            frame,
+            "Smooth Channel",
+            (
+                "Nu_DB = 0.023 * Re^0.8 * Pr^0.3\n"
+                "Nu = C_Nu * Nu_DB\n"
+                "f_smooth = 2 * (2.236 * ln(Re) - 4.639)^-2\n"
+                "P_loss_friction = f_smooth * (L / D_h) * dynamic pressure\n\n"
+                "Required inputs: L, shape geometry, C_Nu.\n"
+                "C_Nu is a user multiplier for calibrated heat transfer. "
+                "Use C_Nu = 1 when no correction is intended."
+            ),
+        )
+        self._formula_section(
+            frame,
+            "Rib Turbulator",
+            (
+                "m = 0 for Angle = 90 deg, otherwise m = 0.35\n"
+                "AR_used = min(W / H, 2)\n"
+                "R(e+) = ((P/e)/10)^0.35 * AR_used^m * "
+                "(12.31 - 27.07*(Angle/90) + 17.86*(Angle/90)^2)\n"
+                "e+ = (e/D_h) * Re * sqrt(f_rib / 2)\n"
+                "f_rib = 0.5 * (R(e+) - 2.5*ln((2e/D_h)*(2W/(W+H))) - 2.5)^-2\n"
+                "The f_rib/e+ pair is solved iteratively.\n"
+                "P_loss_friction = f_rib * (L / D_h) * dynamic pressure\n"
+                "P_loss_rotation = rho * C_rotation * (RPM * Radius * pi / 60)^2 * L\n"
+                "G(e+) = 2.24 * (W/H)^0.1 * (Angle/90)^m * ((P/e)/10)^0.1 * e+^0.35\n"
+                "St = (f_rib/2) / ((G(e+) - R(e+))*sqrt(f_rib/2) + 1)\n"
+                "h = St * rho * Cp * V\n\n"
+                "Required inputs: L, W, H, e/D_h, P/e, angle, radius, RPM, "
+                "C_rotation, ribbed wall count."
+            ),
+        )
+        self._formula_section(
+            frame,
+            "Turning",
+            (
+                "Turning is used for 90 deg, 180 deg, and similar passage turns.\n"
+                "W and H are automatically taken from the average of the adjacent "
+                "upstream and downstream rectangular channels when available.\n"
+                "f_turning = 3 * f_smooth\n"
+                "P_loss_friction = f_turning * (L / D_h) * dynamic pressure\n"
+                "Nu_turning = C_Nu * Nu_DB\n\n"
+                "Required inputs: L, turn angle, C_Nu. Default C_Nu = 1.5.\n"
+                "Bend radius and turn clearance are not used in this first model."
+            ),
+        )
+        self._formula_section(
+            frame,
+            "Pin-Fin Array",
+            (
+                "pins_across = floor(W / S), row_count = floor(L / X)\n"
+                "A_min = W*H - pins_across * D_pin * min(H_pin, H)\n"
+                "V_max = m_dot / (rho * A_min)\n"
+                "Re_D = rho * V_max * D_pin / mu\n"
+                "f_pinfin = 4 * 1.76 * Re_D^-0.318\n"
+                "P_loss_friction = f_pinfin * (L / D_pin) * dynamic pressure based on V_max\n"
+                "Nu = 0.135 * Re_D^0.69 * (S / D_pin)^-0.34\n"
+                "h = Nu * k_air / D_pin\n\n"
+                "Required inputs: L, W, H, D_pin, H_pin, X pitch, S pitch."
+            ),
+        )
+
+    def _formula_section(self, parent: ttk.Frame, title: str, body: str) -> None:
+        panel = self._panel(parent)
+        panel.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(panel, text=title, style="Section.TLabel").pack(
+            anchor=tk.W,
+            pady=(0, 6),
+        )
+        tk.Label(
+            panel,
+            text=body,
+            bg=PANEL_BG,
+            fg=TEXT_COLOR,
+            font=("Segoe UI", 13),
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=1120,
+        ).pack(fill=tk.X, anchor=tk.W)
+
     def _build_results_tab(self) -> None:
         notebook = ttk.Notebook(self.results_tab)
         notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -1680,11 +1821,14 @@ class PassageApp(tk.Tk):
         row: int,
         label: str,
         variable: tk.StringVar,
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=3)
-        ttk.Entry(parent, textvariable=variable).grid(
+    ) -> tuple[ttk.Label, ttk.Entry]:
+        label_widget = ttk.Label(parent, text=label)
+        label_widget.grid(row=row, column=0, sticky=tk.W, pady=3)
+        entry = ttk.Entry(parent, textvariable=variable)
+        entry.grid(
             row=row, column=1, sticky=tk.EW, pady=3
         )
+        return label_widget, entry
 
     def _labeled_combo(
         self,
@@ -1693,11 +1837,14 @@ class PassageApp(tk.Tk):
         label: str,
         variable: tk.StringVar,
         values: tuple[str, ...],
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=3)
-        ttk.Combobox(parent, textvariable=variable, values=values, width=20).grid(
+    ) -> tuple[ttk.Label, ttk.Combobox]:
+        label_widget = ttk.Label(parent, text=label)
+        label_widget.grid(row=row, column=0, sticky=tk.W, pady=3)
+        combo = ttk.Combobox(parent, textvariable=variable, values=values, width=20)
+        combo.grid(
             row=row, column=1, sticky=tk.EW, pady=3
         )
+        return label_widget, combo
 
     def _on_technology_change(self, *_args: object) -> None:
         if self._syncing_edge_form:
@@ -1705,6 +1852,157 @@ class PassageApp(tk.Tk):
         technology = self._edge_vars["cooling_technology"].get()
         self._apply_param_defaults(technology)
         self._render_tech_params(technology)
+        self._update_shape_visibility()
+        self._auto_apply_edge_form()
+
+    def _on_shape_change(self, *_args: object) -> None:
+        self._update_shape_visibility()
+        self._auto_apply_edge_form()
+
+    def _on_wall_mode_change(self, *_args: object) -> None:
+        self._update_wall_field_visibility()
+        self._auto_apply_edge_form()
+
+    def _on_node_kind_change(self, *_args: object) -> None:
+        self._update_node_field_visibility()
+        if self._node_vars["kind"].get() != "inlet":
+            self._clear_node_inlet_values()
+        self._auto_apply_node_form()
+
+    def _install_form_traces(self) -> None:
+        for key, variable in self._node_vars.items():
+            if key != "kind":
+                variable.trace_add("write", lambda *_args: self._auto_apply_node_form())
+        for key, variable in self._edge_vars.items():
+            if key not in {"cooling_technology", "shape", "wall_mode"}:
+                variable.trace_add("write", lambda *_args: self._auto_apply_edge_form())
+        for variable in self._tech_param_vars.values():
+            variable.trace_add("write", lambda *_args: self._auto_apply_edge_form())
+
+    def _update_node_field_visibility(self) -> None:
+        if not hasattr(self, "node_inlet_fields"):
+            return
+        is_inlet = self._node_vars["kind"].get() == "inlet"
+        for widgets in self.node_inlet_fields:
+            for widget in widgets:
+                if is_inlet:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+
+    def _clear_node_inlet_values(self) -> None:
+        if self._suppress_auto_apply:
+            return
+        self._suppress_auto_apply = True
+        try:
+            self._node_vars["inlet_mdot"].set("")
+            self._node_vars["inlet_temperature"].set("")
+            self._node_vars["inlet_pressure"].set("")
+        finally:
+            self._suppress_auto_apply = False
+
+    def _update_shape_visibility(self) -> None:
+        if not hasattr(self, "edge_geometry_fields"):
+            return
+        shape = self._edge_vars["shape"].get()
+        technology = _normalize_technology(self._edge_vars["cooling_technology"].get())
+        is_turning = technology == "turning"
+        visible = {
+            "length": True,
+            "width": shape == "rectangular" and not is_turning,
+            "height": shape == "rectangular" and not is_turning,
+            "diameter": shape == "circular" and not is_turning,
+        }
+        for key, widgets in self.edge_geometry_fields.items():
+            for widget in widgets:
+                if visible.get(key, True):
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+
+    def _update_wall_field_visibility(self) -> None:
+        if not hasattr(self, "edge_wall_fields"):
+            return
+        wall_mode = self._edge_vars["wall_mode"].get()
+        visible = {
+            "wall_temperature": wall_mode == "wall_temperature",
+            "heat_flux": wall_mode == "heat_flux",
+            "external_htc": wall_mode == "heat_flux",
+        }
+        for key, widgets in self.edge_wall_fields.items():
+            for widget in widgets:
+                if visible.get(key, False):
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+
+    def _auto_apply_node_form(self) -> None:
+        if self._suppress_auto_apply:
+            return
+        index = self._selected_index(self.node_tree) if hasattr(self, "node_tree") else None
+        if index is None or index >= len(self.node_rows):
+            return
+        row = {key: variable.get().strip() for key, variable in self._node_vars.items()}
+        if not row["node_id"] or self._id_exists(row["node_id"], self.node_rows, index, "node_id"):
+            return
+        if row["kind"] != "inlet":
+            row["inlet_mdot"] = ""
+            row["inlet_temperature"] = ""
+            row["inlet_pressure"] = ""
+        old_id = self.node_rows[index]["node_id"]
+        self.node_rows[index] = row
+        if row["node_id"] != old_id:
+            if old_id in self.node_positions:
+                self.node_positions[row["node_id"]] = self.node_positions.pop(old_id)
+            for edge in self.edge_rows:
+                if edge["from_node"] == old_id:
+                    edge["from_node"] = row["node_id"]
+                if edge["to_node"] == old_id:
+                    edge["to_node"] = row["node_id"]
+        self._refresh_after_auto_node_change(index)
+
+    def _auto_apply_edge_form(self) -> None:
+        if self._suppress_auto_apply or self._syncing_edge_form:
+            return
+        index = self._selected_index(self.edge_tree) if hasattr(self, "edge_tree") else None
+        if index is None or index >= len(self.edge_rows):
+            return
+        row = self._edge_form_to_row()
+        if not row["edge_id"] or self._id_exists(row["edge_id"], self.edge_rows, index, "edge_id"):
+            return
+        self.edge_rows[index] = row
+        self.selected_edge_id = row["edge_id"]
+        self.selected_node_id = None
+        self._convert_source_outlet_to_internal(row["from_node"])
+        self._refresh_after_auto_edge_change(index)
+
+    def _refresh_after_auto_node_change(self, index: int) -> None:
+        self._suppress_auto_apply = True
+        try:
+            self._ensure_node_positions()
+            self._refresh_node_tree()
+            self._refresh_edge_tree()
+            self._refresh_node_combos()
+            self._update_dashboard_summary()
+            self.node_tree.selection_set(str(index))
+            self.node_tree.focus(str(index))
+            self.selected_node_id = self.node_rows[index]["node_id"]
+            self.selected_edge_id = None
+        finally:
+            self._suppress_auto_apply = False
+        self._after_apply()
+
+    def _refresh_after_auto_edge_change(self, index: int) -> None:
+        self._suppress_auto_apply = True
+        try:
+            self._refresh_node_tree()
+            self._refresh_edge_tree()
+            self._update_dashboard_summary()
+            self.edge_tree.selection_set(str(index))
+            self.edge_tree.focus(str(index))
+        finally:
+            self._suppress_auto_apply = False
+        self._after_apply()
 
     def _apply_param_defaults(self, technology: str) -> None:
         for spec in TECH_PARAM_SPECS.get(technology, ()):
@@ -1845,21 +2143,30 @@ class PassageApp(tk.Tk):
 
     def _populate_node_form(self, index: int) -> None:
         row = self.node_rows[index]
-        for key, variable in self._node_vars.items():
-            variable.set(row[key])
+        self._suppress_auto_apply = True
+        try:
+            for key, variable in self._node_vars.items():
+                variable.set(row[key])
+        finally:
+            self._suppress_auto_apply = False
+        self._update_node_field_visibility()
 
     def _populate_edge_form(self, index: int) -> None:
         row = self.edge_rows[index]
         self._syncing_edge_form = True
+        self._suppress_auto_apply = True
         try:
             for key, variable in self._edge_vars.items():
                 variable.set(row[key])
             for key, variable in self._tech_param_vars.items():
                 variable.set(row.get(_param_row_key(key), ""))
         finally:
+            self._suppress_auto_apply = False
             self._syncing_edge_form = False
         self._apply_param_defaults(row["cooling_technology"])
         self._render_tech_params(row["cooling_technology"])
+        self._update_shape_visibility()
+        self._update_wall_field_visibility()
         self.params_text.delete("1.0", tk.END)
         self.params_text.insert("1.0", row["params_text"])
 
@@ -1876,6 +2183,10 @@ class PassageApp(tk.Tk):
         if self._id_exists(row["node_id"], self.node_rows, index, "node_id"):
             messagebox.showerror("Invalid node", "Node ID must be unique.")
             return
+        if row["kind"] != "inlet":
+            row["inlet_mdot"] = ""
+            row["inlet_temperature"] = ""
+            row["inlet_pressure"] = ""
         self.node_rows[index] = row
         if row["node_id"] != old_id:
             if old_id in self.node_positions:
@@ -1950,7 +2261,9 @@ class PassageApp(tk.Tk):
         self.edge_rows[index] = row
         self.selected_edge_id = row["edge_id"]
         self.selected_node_id = None
+        self._convert_source_outlet_to_internal(row["from_node"])
         self._refresh_edge_tree()
+        self._refresh_node_tree()
         self._update_dashboard_summary()
         self.edge_tree.selection_set(str(index))
         self._after_apply()
@@ -1969,7 +2282,9 @@ class PassageApp(tk.Tk):
             {row["edge_id"] for row in self.edge_rows},
         )
         self.edge_rows.append(self._default_edge_row(edge_id, from_node, to_node))
+        self._convert_source_outlet_to_internal(from_node)
         self._refresh_edge_tree()
+        self._refresh_node_tree()
         self._update_dashboard_summary()
         index = len(self.edge_rows) - 1
         self.edge_tree.selection_set(str(index))
@@ -1987,6 +2302,24 @@ class PassageApp(tk.Tk):
 
     def _edge_form_to_row(self) -> dict[str, str]:
         row = {key: variable.get().strip() for key, variable in self._edge_vars.items()}
+        row["cooling_technology"] = _normalize_technology(row["cooling_technology"])
+        if row["cooling_technology"] == "turning":
+            row["shape"] = "rectangular"
+            row["width"] = ""
+            row["height"] = ""
+            row["diameter"] = ""
+        if row["shape"] == "rectangular":
+            row["diameter"] = ""
+        elif row["shape"] == "circular":
+            row["width"] = ""
+            row["height"] = ""
+        if row["wall_mode"] != "wall_temperature":
+            row["wall_temperature"] = ""
+        if row["wall_mode"] != "heat_flux":
+            row["heat_flux"] = ""
+            row["external_htc"] = ""
+        row["flow_fraction"] = ""
+        row["fixed_mdot"] = ""
         for key, variable in self._tech_param_vars.items():
             row[_param_row_key(key)] = variable.get().strip()
         row["params_text"] = self.params_text.get("1.0", tk.END).strip()
@@ -2059,9 +2392,9 @@ class PassageApp(tk.Tk):
             NodeSpec(
                 node_id=row["node_id"],
                 kind=row["kind"],  # type: ignore[arg-type]
-                inlet_mdot=_optional_float(row["inlet_mdot"]),
-                inlet_temperature=_optional_float(row["inlet_temperature"]),
-                inlet_pressure=_optional_float(row["inlet_pressure"]),
+                inlet_mdot=_optional_float(row["inlet_mdot"]) if row["kind"] == "inlet" else None,
+                inlet_temperature=_optional_float(row["inlet_temperature"]) if row["kind"] == "inlet" else None,
+                inlet_pressure=_optional_float(row["inlet_pressure"]) if row["kind"] == "inlet" else None,
             )
             for row in self.node_rows
         ]
@@ -2086,11 +2419,11 @@ class PassageApp(tk.Tk):
                     from_node=row["from_node"],
                     to_node=row["to_node"],
                     geometry=geometry,
-                    cooling_technology=row["cooling_technology"],  # type: ignore[arg-type]
+                    cooling_technology=_normalize_technology(row["cooling_technology"]),  # type: ignore[arg-type]
                     wall=wall,
                     params=_params_from_row(row),
-                    flow_fraction=_optional_float(row["flow_fraction"]),
-                    fixed_mdot=_optional_float(row["fixed_mdot"]),
+                    flow_fraction=None,
+                    fixed_mdot=None,
                 )
             )
         return NetworkSpec(nodes=nodes, edges=edges)
@@ -2146,7 +2479,7 @@ class PassageApp(tk.Tk):
             "nodes": str(len(self.node_rows)),
             "edges": str(len(self.edge_rows)),
             "inlets": str(len(inlet_rows)),
-            "flow": f"{total_flow:.6f} kg/s",
+            "flow": f"{total_flow:,.6f} kg/s",
             "property_model": self.property_model.get(),
         }
         for key, value in values.items():
@@ -2309,30 +2642,33 @@ class PassageApp(tk.Tk):
 
 
 def _node_to_row(node: NodeSpec) -> dict[str, str]:
+    is_inlet = node.kind == "inlet"
     return {
         "node_id": node.node_id,
         "kind": node.kind,
-        "inlet_mdot": _fmt_optional(node.inlet_mdot),
-        "inlet_temperature": _fmt_optional(node.inlet_temperature),
-        "inlet_pressure": _fmt_optional(node.inlet_pressure),
+        "inlet_mdot": _fmt_optional(node.inlet_mdot) if is_inlet else "",
+        "inlet_temperature": _fmt_optional(node.inlet_temperature) if is_inlet else "",
+        "inlet_pressure": _fmt_optional(node.inlet_pressure) if is_inlet else "",
     }
 
 
 def _edge_to_row(edge: EdgeSpec) -> dict[str, str]:
     geometry = edge.geometry
-    row = _default_param_row(edge.cooling_technology)
+    technology = _normalize_technology(edge.cooling_technology)
+    row = _default_param_row(technology)
+    edge_params = _normalize_edge_params(technology, edge.params)
     for key in ALL_PARAM_KEYS:
-        if key in edge.params:
-            row[_param_row_key(key)] = _fmt_param_value(edge.params[key])
+        if key in edge_params:
+            row[_param_row_key(key)] = _fmt_param_value(edge_params[key])
     additional_params = {
-        key: value for key, value in edge.params.items() if key not in ALL_PARAM_KEYS
+        key: value for key, value in edge_params.items() if key not in ALL_PARAM_KEYS
     }
     row.update(
         {
             "edge_id": edge.edge_id,
             "from_node": edge.from_node,
             "to_node": edge.to_node,
-            "cooling_technology": edge.cooling_technology,
+            "cooling_technology": technology,
             "shape": geometry.shape,
             "length": _fmt_optional(geometry.length),
             "width": _fmt_optional(geometry.width),
@@ -2363,12 +2699,26 @@ def _default_param_row(technology: str) -> dict[str, str]:
 
 def _params_from_row(row: dict[str, str]) -> dict[str, Any]:
     params = _parse_params(row["params_text"])
-    technology = row["cooling_technology"]
+    technology = _normalize_technology(row["cooling_technology"])
     for spec in TECH_PARAM_SPECS.get(technology, ()):
         value = row.get(_param_row_key(spec.key), "").strip()
         if value:
             params[spec.key] = _parse_value(value)
     return params
+
+
+def _normalize_technology(technology: str) -> str:
+    return "turning" if technology == "u_turn" else technology
+
+
+def _normalize_edge_params(technology: str, params: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(params)
+    if technology == "turning" and "c_nu" not in normalized:
+        if "nu_multiplier_turn" in normalized:
+            normalized["c_nu"] = normalized["nu_multiplier_turn"]
+        elif "nu_multiplier" in normalized:
+            normalized["c_nu"] = normalized["nu_multiplier"]
+    return normalized
 
 
 def _auto_node_positions(node_ids: list[str]) -> dict[str, tuple[float, float]]:
@@ -2449,7 +2799,7 @@ def _parse_value(value: str) -> Any:
     if lowered in {"none", "null"}:
         return None
     try:
-        number = float(value)
+        number = float(value.replace(",", ""))
     except ValueError:
         return value.strip("\"'")
     if number.is_integer() and "." not in value and "e" not in lowered:
@@ -2463,7 +2813,7 @@ def _optional_float(value: str | None) -> float | None:
     stripped = value.strip()
     if not stripped:
         return None
-    return float(stripped)
+    return float(stripped.replace(",", ""))
 
 
 def _required_float(value: str, name: str) -> float:
@@ -2476,7 +2826,7 @@ def _required_float(value: str, name: str) -> float:
 def _fmt_optional(value: float | int | None) -> str:
     if value is None:
         return ""
-    return f"{value:g}"
+    return f"{value:,.6g}"
 
 
 def _fmt_param_value(value: Any) -> str:
@@ -2485,12 +2835,12 @@ def _fmt_param_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
-        return f"{value:g}"
+        return f"{value:,.6g}"
     return str(value)
 
 
 def _fmt_number(value: float, digits: int) -> str:
-    return f"{value:.{digits}f}"
+    return f"{value:,.{digits}f}"
 
 
 def _write_result_csv(path: Path, result: SolverResult) -> None:
@@ -2521,7 +2871,9 @@ def _write_result_csv(path: Path, result: SolverResult) -> None:
                 "nusselt",
                 "htc_w_m2_k",
                 "friction_factor_darcy",
-                "dp_pa",
+                "dp_friction_pa",
+                "dp_rotation_pa",
+                "dp_total_pa",
                 "q_w",
                 "tout_k",
                 "pout_pa",
@@ -2539,6 +2891,8 @@ def _write_result_csv(path: Path, result: SolverResult) -> None:
                     edge.nusselt,
                     edge.htc,
                     edge.friction_factor_darcy,
+                    edge.dp_friction,
+                    edge.dp_rotation,
                     edge.dp_total,
                     edge.heat_rate,
                     edge.outlet_temperature,

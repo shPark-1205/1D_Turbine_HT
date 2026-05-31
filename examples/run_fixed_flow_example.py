@@ -28,12 +28,16 @@ def main() -> None:
         )
 
     print("\nEdge results")
-    print("edge, tech, Re, Nu, h[W/m2-K], f_D, dp[Pa], q[W], Tout[K]")
+    print(
+        "edge, tech, Re, Nu, h[W/m2-K], f_D, "
+        "dp_friction[Pa], dp_rotation[Pa], dp_total[Pa], q[W], Tout[K]"
+    )
     for edge_id, edge in result.edges.items():
         print(
             f"{edge_id}, {edge.cooling_technology}, {edge.reynolds:.0f}, "
             f"{edge.nusselt:.2f}, {edge.htc:.2f}, "
-            f"{edge.friction_factor_darcy:.5f}, {edge.dp_total:.1f}, "
+            f"{edge.friction_factor_darcy:.5f}, {edge.dp_friction:.1f}, "
+            f"{edge.dp_rotation:.1f}, {edge.dp_total:.1f}, "
             f"{edge.heat_rate:.1f}, {edge.outlet_temperature:.2f}"
         )
 

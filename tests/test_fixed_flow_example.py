@@ -27,6 +27,11 @@ class FixedFlowExampleTest(unittest.TestCase):
             self.assertGreater(edge.htc, 0.0)
             self.assertTrue(math.isfinite(edge.dp_total))
 
+        self.assertGreater(result.edges["2_to_3"].dp_rotation, 0.0)
+        self.assertEqual(result.edges["3_to_4"].cooling_technology, "turning")
+        self.assertEqual(result.edges["7_to_8"].intermediate["row_count"], 6)
+        self.assertEqual(result.edges["7_to_8"].intermediate["pins_cross"], 10)
+
     def test_sample_can_be_extended_after_original_outlet(self) -> None:
         network = build_default_network()
         nodes = [
