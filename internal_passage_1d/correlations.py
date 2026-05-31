@@ -63,7 +63,7 @@ def evaluate_edge(
         )
 
     wall_warnings: list[str] = []
-    heat_rate = _heat_rate(
+    heat_rate, wall_intermediate = _heat_rate(
         edge=edge,
         htc=ht.htc,
         area=ht.heat_transfer_area,
@@ -114,6 +114,7 @@ def evaluate_edge(
             "reference_temperature_k": reference_temperature,
         }
     )
+    intermediate.update(wall_intermediate)
 
     return EdgeResult(
         edge_id=edge.edge_id,
@@ -397,14 +398,12 @@ def _heat_rate(
     reference_temperature: float,
     options: SolverOptions,
     warnings: list[str],
-) -> float:
+) -> tuple[float, dict[str, Any]]:
     wall = edge.wall
-    if wall.external_htc is not None:
-        warnings.append(
-            f"{edge.edge_id}: external_htc is stored but wall conduction is not coupled yet."
-        )
+    details: dict[str, Any] = {"wall_mode": wall.mode}
     if wall.mode == "adiabatic":
-        return 0.0
+        details["heat_flux_w_m2"] = 0.0
+        return 0.0, details
     if wall.mode == "wall_temperature":
         if wall.wall_temperature is None:
             raise ValueError(f"{edge.edge_id}: wall_temperature is required.")
@@ -413,12 +412,159 @@ def _heat_rate(
             if options.thermal_driving_temperature == "reference"
             else inlet_temperature
         )
-        return htc * area * (wall.wall_temperature - fluid_temperature)
+        heat_rate = htc * area * (wall.wall_temperature - fluid_temperature)
+        details.update(
+            {
+                "thermal_area_m2": area,
+                "fluid_reference_temperature_k": fluid_temperature,
+                "coolant_side_wall_temperature_k": wall.wall_temperature,
+                "heat_flux_w_m2": heat_rate / area,
+            }
+        )
+        return heat_rate, details
     if wall.mode == "heat_flux":
         if wall.heat_flux is None:
             raise ValueError(f"{edge.edge_id}: heat_flux is required.")
-        return wall.heat_flux * area
+        heat_rate = wall.heat_flux * area
+        details.update(
+            {
+                "thermal_area_m2": area,
+                "heat_flux_w_m2": wall.heat_flux,
+            }
+        )
+        return heat_rate, details
+    if wall.mode == "external_convection":
+        return _external_convection_heat_rate(
+            edge=edge,
+            wall=wall,
+            htc=htc,
+            area=area,
+            inlet_temperature=inlet_temperature,
+            reference_temperature=reference_temperature,
+            options=options,
+        )
     raise ValueError(f"Unsupported wall mode: {wall.mode}")
+
+
+def _external_convection_heat_rate(
+    edge: EdgeSpec,
+    wall,
+    htc: float,
+    area: float,
+    inlet_temperature: float,
+    reference_temperature: float,
+    options: SolverOptions,
+) -> tuple[float, dict[str, Any]]:
+    if area <= 0.0:
+        raise ValueError(f"{edge.edge_id}: heat-transfer area must be positive.")
+    if htc <= 0.0:
+        raise ValueError(f"{edge.edge_id}: internal HTC must be positive.")
+    external_temperature = _positive_wall_value(
+        wall.external_temperature,
+        "external_temperature",
+        edge.edge_id,
+    )
+    external_htc = _positive_wall_value(
+        wall.external_htc,
+        "external_htc",
+        edge.edge_id,
+    )
+    wall_thickness = _nonnegative_wall_value(
+        wall.wall_thickness,
+        "wall_thickness",
+        edge.edge_id,
+    )
+    wall_conductivity = _layer_conductivity(
+        wall.wall_conductivity,
+        wall_thickness,
+        "wall_conductivity",
+        edge.edge_id,
+    )
+    tbc_thickness = _nonnegative_wall_value(
+        wall.tbc_thickness,
+        "tbc_thickness",
+        edge.edge_id,
+        default=0.0,
+    )
+    tbc_conductivity = _layer_conductivity(
+        wall.tbc_conductivity,
+        tbc_thickness,
+        "tbc_conductivity",
+        edge.edge_id,
+    )
+    fluid_temperature = (
+        reference_temperature
+        if options.thermal_driving_temperature == "reference"
+        else inlet_temperature
+    )
+
+    r_internal = 1.0 / (htc * area)
+    r_wall = wall_thickness / (wall_conductivity * area) if wall_thickness else 0.0
+    r_tbc = tbc_thickness / (tbc_conductivity * area) if tbc_thickness else 0.0
+    r_external = 1.0 / (external_htc * area)
+    r_total = r_internal + r_wall + r_tbc + r_external
+    heat_rate = (external_temperature - fluid_temperature) / r_total
+
+    coolant_side_wall_t = fluid_temperature + heat_rate * r_internal
+    metal_outer_t = coolant_side_wall_t + heat_rate * r_wall
+    tbc_outer_t = metal_outer_t + heat_rate * r_tbc
+    details = {
+        "wall_mode": "external_convection",
+        "thermal_area_m2": area,
+        "fluid_reference_temperature_k": fluid_temperature,
+        "external_temperature_k": external_temperature,
+        "external_htc_w_m2_k": external_htc,
+        "wall_thickness_m": wall_thickness,
+        "wall_conductivity_w_m_k": wall_conductivity,
+        "tbc_thickness_m": tbc_thickness,
+        "tbc_conductivity_w_m_k": tbc_conductivity,
+        "r_internal_k_w": r_internal,
+        "r_wall_k_w": r_wall,
+        "r_tbc_k_w": r_tbc,
+        "r_external_k_w": r_external,
+        "r_total_k_w": r_total,
+        "heat_flux_w_m2": heat_rate / area,
+        "coolant_side_wall_temperature_k": coolant_side_wall_t,
+        "metal_outer_temperature_k": metal_outer_t,
+        "tbc_outer_temperature_k": tbc_outer_t,
+    }
+    return heat_rate, details
+
+
+def _positive_wall_value(value: float | None, name: str, edge_id: str) -> float:
+    if value is None or value <= 0.0:
+        raise ValueError(f"{edge_id}: {name} must be positive.")
+    return value
+
+
+def _nonnegative_wall_value(
+    value: float | None,
+    name: str,
+    edge_id: str,
+    default: float | None = None,
+) -> float:
+    if value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{edge_id}: {name} is required.")
+    if value < 0.0:
+        raise ValueError(f"{edge_id}: {name} must be non-negative.")
+    return value
+
+
+def _layer_conductivity(
+    value: float | None,
+    thickness: float,
+    name: str,
+    edge_id: str,
+) -> float:
+    if thickness == 0.0:
+        return 1.0
+    if value is None or value <= 0.0:
+        raise ValueError(
+            f"{edge_id}: {name} must be positive when layer thickness is set."
+        )
+    return value
 
 
 def _dittus_boelter(reynolds: float, prandtl: float) -> float:

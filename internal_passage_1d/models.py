@@ -6,7 +6,12 @@ from typing import Any, Literal
 
 
 NodeKind = Literal["inlet", "internal", "merge", "split", "outlet"]
-WallMode = Literal["adiabatic", "wall_temperature", "heat_flux"]
+WallMode = Literal[
+    "adiabatic",
+    "wall_temperature",
+    "heat_flux",
+    "external_convection",
+]
 GeometryShape = Literal["rectangular", "circular"]
 CoolingTechnology = Literal["smooth", "rib", "turning", "pin_fin"]
 PropertyModel = Literal["ideal_gas", "coolprop"]
@@ -65,6 +70,11 @@ class WallBoundary:
     wall_temperature: float | None = None
     heat_flux: float | None = None
     external_htc: float | None = None
+    external_temperature: float | None = None
+    wall_thickness: float | None = None
+    wall_conductivity: float | None = None
+    tbc_thickness: float | None = None
+    tbc_conductivity: float | None = None
 
 
 @dataclass(frozen=True)

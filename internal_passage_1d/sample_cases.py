@@ -8,7 +8,15 @@ def build_default_network() -> NetworkSpec:
 
     inlet_t = 694.9
     inlet_p = 707_000.0
-    hot_wall = WallBoundary(mode="wall_temperature", wall_temperature=950.0)
+    hot_wall = WallBoundary(
+        mode="external_convection",
+        external_temperature=1150.0,
+        external_htc=1200.0,
+        wall_thickness=0.0015,
+        wall_conductivity=18.0,
+        tbc_thickness=0.00025,
+        tbc_conductivity=1.2,
+    )
 
     nodes = [
         NodeSpec(

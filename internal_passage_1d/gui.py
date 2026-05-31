@@ -28,8 +28,17 @@ from .sample_cases import build_default_network
 NODE_KINDS = ("inlet", "internal", "merge", "split", "outlet")
 TECHNOLOGIES = ("smooth", "rib", "turning", "pin_fin")
 SHAPES = ("rectangular", "circular")
-WALL_MODES = ("adiabatic", "wall_temperature", "heat_flux")
+WALL_MODES = ("adiabatic", "wall_temperature", "heat_flux", "external_convection")
 PROPERTY_MODELS = ("ideal_gas", "coolprop")
+OVERLAY_METRICS = (
+    "Technology",
+    "Edge Tout [K]",
+    "Edge HTC [W/m2-K]",
+    "Edge dp [Pa]",
+    "Edge q [W]",
+    "Node T [K]",
+    "Node P [Pa]",
+)
 IMAGE_FILETYPES = (
     ("Image files", "*.png *.jpg *.jpeg *.gif *.ppm *.pgm"),
     ("PNG files", "*.png"),
@@ -127,6 +136,7 @@ class PassageApp(tk.Tk):
         self._workspace_scroll_canvas: tk.Canvas | None = None
 
         self.property_model = tk.StringVar(value="ideal_gas")
+        self.overlay_metric = tk.StringVar(value="Technology")
         self.auto_calculate = tk.BooleanVar(value=False)
 
         self._node_vars = {
@@ -150,6 +160,11 @@ class PassageApp(tk.Tk):
             "wall_temperature": tk.StringVar(),
             "heat_flux": tk.StringVar(),
             "external_htc": tk.StringVar(),
+            "external_temperature": tk.StringVar(),
+            "wall_thickness": tk.StringVar(),
+            "wall_conductivity": tk.StringVar(),
+            "tbc_thickness": tk.StringVar(),
+            "tbc_conductivity": tk.StringVar(),
             "flow_fraction": tk.StringVar(),
             "fixed_mdot": tk.StringVar(),
         }
@@ -168,6 +183,9 @@ class PassageApp(tk.Tk):
         self._node_vars["kind"].trace_add("write", self._on_node_kind_change)
         self.property_model.trace_add(
             "write", lambda *_args: self._update_dashboard_summary()
+        )
+        self.overlay_metric.trace_add(
+            "write", lambda *_args: self._redraw_layout_canvas()
         )
         self._load_network(build_default_network())
         self.calculate(show_success=False)
@@ -384,6 +402,17 @@ class PassageApp(tk.Tk):
             text="Reset Positions",
             command=self.reset_layout_positions,
         ).pack(side=tk.LEFT)
+        ttk.Label(canvas_toolbar, text="Overlay", style="Header.TLabel").pack(
+            side=tk.LEFT,
+            padx=(12, 4),
+        )
+        ttk.Combobox(
+            canvas_toolbar,
+            textvariable=self.overlay_metric,
+            values=OVERLAY_METRICS,
+            state="readonly",
+            width=18,
+        ).pack(side=tk.LEFT)
         self.layout_status_label = ttk.Label(
             canvas_toolbar,
             text="Mode: Select / Move",
@@ -440,6 +469,7 @@ class PassageApp(tk.Tk):
         self._build_workspace_summary(right)
         self._build_workspace_node_editor(right)
         self._build_workspace_edge_editor(right)
+        self._build_selected_result_panel(right)
         self._build_workspace_tables(right)
 
     def _build_workspace_summary(self, parent: ttk.Frame) -> None:
@@ -594,7 +624,12 @@ class PassageApp(tk.Tk):
         for label, key in (
             ("Wall T [K]", "wall_temperature"),
             ("Heat flux [W/m2]", "heat_flux"),
+            ("External gas T [K]", "external_temperature"),
             ("External h [W/m2-K]", "external_htc"),
+            ("Blade wall thickness [m]", "wall_thickness"),
+            ("Blade wall k [W/m-K]", "wall_conductivity"),
+            ("TBC thickness [m]", "tbc_thickness"),
+            ("TBC k [W/m-K]", "tbc_conductivity"),
         ):
             self.edge_wall_fields[key] = self._labeled_entry(
                 edge_panel,
@@ -633,6 +668,36 @@ class PassageApp(tk.Tk):
         ttk.Button(buttons, text="Delete Edge", command=self.delete_edge).pack(
             side=tk.LEFT, padx=6
         )
+
+    def _build_selected_result_panel(self, parent: ttk.Frame) -> None:
+        result_panel = self._panel(parent)
+        result_panel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            result_panel,
+            text="Selected Edge Result",
+            style="Section.TLabel",
+        ).pack(anchor=tk.W, pady=(0, 8))
+        self.selected_result_text = tk.Text(
+            result_panel,
+            height=8,
+            wrap=tk.WORD,
+            bg="#fbfcfe",
+            fg=TEXT_COLOR,
+            font=("Segoe UI", 11),
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+        )
+        self.selected_result_text.pack(fill=tk.X)
+        self.wall_stack_canvas = tk.Canvas(
+            result_panel,
+            height=150,
+            bg="#fbfcfe",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+        )
+        self.wall_stack_canvas.pack(fill=tk.X, pady=(8, 0))
+        self._update_selected_result_panel()
 
     def _build_workspace_tables(self, parent: ttk.Frame) -> None:
         table_panel = self._panel(parent)
@@ -1116,6 +1181,8 @@ class PassageApp(tk.Tk):
         self._layout_image_bbox = (x0, y0, display_width, display_height)
 
     def _draw_layout_edges(self, canvas: tk.Canvas) -> None:
+        metric = self.overlay_metric.get() if hasattr(self, "overlay_metric") else "Technology"
+        metric_values = self._overlay_edge_values(metric)
         for row in self.edge_rows:
             from_pos = self.node_positions.get(row["from_node"])
             to_pos = self.node_positions.get(row["to_node"])
@@ -1124,13 +1191,17 @@ class PassageApp(tk.Tk):
             x1, y1 = self._layout_to_canvas(from_pos)
             x2, y2 = self._layout_to_canvas(to_pos)
             is_selected = row["edge_id"] == self.selected_edge_id
+            overlay_value = metric_values.get(row["edge_id"])
+            color = ACCENT_COLOR
+            if overlay_value is not None:
+                color = _value_to_color(overlay_value, list(metric_values.values()))
             canvas.create_line(
                 x1,
                 y1,
                 x2,
                 y2,
-                fill=WARNING_COLOR if is_selected else ACCENT_COLOR,
-                width=5 if is_selected else 3,
+                fill=WARNING_COLOR if is_selected else color,
+                width=7 if overlay_value is not None else (5 if is_selected else 3),
                 arrow=tk.LAST,
                 arrowshape=(14, 16, 6),
             )
@@ -1147,12 +1218,14 @@ class PassageApp(tk.Tk):
             canvas.create_text(
                 mid_x,
                 mid_y,
-                text=row["cooling_technology"],
+                text=self._edge_overlay_label(row, metric, overlay_value),
                 fill=TEXT_COLOR,
                 font=("Segoe UI", 8, "bold"),
             )
 
     def _draw_layout_nodes(self, canvas: tk.Canvas) -> None:
+        metric = self.overlay_metric.get() if hasattr(self, "overlay_metric") else "Technology"
+        metric_values = self._overlay_node_values(metric)
         for row in self.node_rows:
             node_id = row["node_id"]
             position = self.node_positions.get(node_id)
@@ -1161,7 +1234,10 @@ class PassageApp(tk.Tk):
             x, y = self._layout_to_canvas(position)
             radius = 15 if row["kind"] != "inlet" else 17
             is_selected = node_id == self.selected_node_id
-            fill = "#fff8e8" if is_selected else "#ffffff"
+            overlay_value = metric_values.get(node_id)
+            fill = _value_to_color(overlay_value, list(metric_values.values())) if overlay_value is not None else "#ffffff"
+            if is_selected:
+                fill = "#fff8e8"
             outline = ACCENT_COLOR
             if row["kind"] == "inlet":
                 outline = SAFE_COLOR
@@ -1187,6 +1263,50 @@ class PassageApp(tk.Tk):
                 fill=TEXT_COLOR,
                 font=("Segoe UI", 11, "bold"),
             )
+
+    def _overlay_edge_values(self, metric: str) -> dict[str, float]:
+        if self.last_result is None:
+            return {}
+        values: dict[str, float] = {}
+        for edge_id, edge in self.last_result.edges.items():
+            if metric == "Edge Tout [K]":
+                values[edge_id] = edge.outlet_temperature
+            elif metric == "Edge HTC [W/m2-K]":
+                values[edge_id] = edge.htc
+            elif metric == "Edge dp [Pa]":
+                values[edge_id] = edge.dp_total
+            elif metric == "Edge q [W]":
+                values[edge_id] = edge.heat_rate
+        return values
+
+    def _overlay_node_values(self, metric: str) -> dict[str, float]:
+        if self.last_result is None:
+            return {}
+        values: dict[str, float] = {}
+        for node_id, node in self.last_result.nodes.items():
+            if metric == "Node T [K]":
+                values[node_id] = node.temperature
+            elif metric == "Node P [Pa]":
+                values[node_id] = node.pressure
+        return values
+
+    def _edge_overlay_label(
+        self,
+        row: dict[str, str],
+        metric: str,
+        value: float | None,
+    ) -> str:
+        if value is None or metric == "Technology":
+            return row["cooling_technology"]
+        if metric == "Edge HTC [W/m2-K]":
+            return f"h={value:,.0f}"
+        if metric == "Edge dp [Pa]":
+            return f"dp={value:,.0f}"
+        if metric == "Edge q [W]":
+            return f"q={value:,.0f}"
+        if metric == "Edge Tout [K]":
+            return f"T={value:,.1f}"
+        return _fmt_number(value, 2)
 
     def _layout_to_canvas(self, position: tuple[float, float]) -> tuple[float, float]:
         x0, y0, width, height = self._layout_image_bbox
@@ -1254,6 +1374,7 @@ class PassageApp(tk.Tk):
 
         self.selected_node_id = None
         self.selected_edge_id = None
+        self._update_selected_result_panel()
         self._redraw_layout_canvas()
 
     def _on_layout_drag(self, event: tk.Event) -> None:
@@ -1314,6 +1435,7 @@ class PassageApp(tk.Tk):
         self._populate_node_form(index)
         if hasattr(self, "edge_tree"):
             self.edge_tree.selection_remove(self.edge_tree.selection())
+        self._update_selected_result_panel()
         self._redraw_layout_canvas()
 
     def _select_edge_by_id(self, edge_id: str) -> None:
@@ -1327,6 +1449,7 @@ class PassageApp(tk.Tk):
         self._populate_edge_form(index)
         if hasattr(self, "node_tree"):
             self.node_tree.selection_remove(self.node_tree.selection())
+        self._update_selected_result_panel()
         self._redraw_layout_canvas()
 
     def _node_index(self, node_id: str) -> int | None:
@@ -1403,6 +1526,11 @@ class PassageApp(tk.Tk):
             "wall_temperature": "",
             "heat_flux": "",
             "external_htc": "",
+            "external_temperature": "",
+            "wall_thickness": "",
+            "wall_conductivity": "",
+            "tbc_thickness": "",
+            "tbc_conductivity": "",
             "flow_fraction": "",
             "fixed_mdot": "",
             "params_text": "",
@@ -1637,92 +1765,168 @@ class PassageApp(tk.Tk):
         self._formula_section(
             frame,
             "Pressure Update",
+            "\n".join(
+                (
+                    r"\begin{aligned}",
+                    r"P_{out} &= P_{in}-\Delta P_{friction}-\Delta P_{rotation}",
+                    r"q_{dyn} &= \frac{1}{2}\rho V^2",
+                    r"\Delta P_{friction} &= f\,\frac{L}{D}\,q_{dyn}",
+                    r"\end{aligned}",
+                )
+            ),
             (
-                "P_out = P_in - P_loss_friction - P_loss_rotation\n"
-                "Smooth channel, turning, and pin-fin set P_loss_rotation = 0.\n"
-                "Dynamic pressure = 0.5 * rho * V^2."
+                ("q_dyn", "Dynamic pressure"),
+                ("D", "D_h for channels/turning, D_pin for pin-fin pressure loss"),
+                ("Delta P_rotation", "Only rib edges use the rotation term"),
             ),
         )
         self._formula_section(
             frame,
             "Smooth Channel",
+            "\n".join(
+                (
+                    r"\begin{aligned}",
+                    r"Nu_{DB} &= 0.023\,Re^{0.8}Pr^{0.3}",
+                    r"Nu &= C_{Nu}\,Nu_{DB}",
+                    r"f_{smooth} &= 2\left(2.236\ln Re - 4.639\right)^{-2}",
+                    r"\Delta P_{friction} &= f_{smooth}\frac{L}{D_h}q_{dyn}",
+                    r"\end{aligned}",
+                )
+            ),
             (
-                "Nu_DB = 0.023 * Re^0.8 * Pr^0.3\n"
-                "Nu = C_Nu * Nu_DB\n"
-                "f_smooth = 2 * (2.236 * ln(Re) - 4.639)^-2\n"
-                "P_loss_friction = f_smooth * (L / D_h) * dynamic pressure\n\n"
-                "Required inputs: L, shape geometry, C_Nu.\n"
-                "C_Nu is a user multiplier for calibrated heat transfer. "
-                "Use C_Nu = 1 when no correction is intended."
+                ("C_Nu", "User heat-transfer multiplier; use 1.0 when no correction is intended"),
+                ("Inputs", "L, geometry, C_Nu"),
             ),
         )
         self._formula_section(
             frame,
             "Rib Turbulator",
+            "\n".join(
+                (
+                    r"\begin{aligned}",
+                    r"m &= \begin{cases}0,&\theta=90^\circ\\0.35,&\theta<90^\circ\end{cases}",
+                    r"AR_{used} &= \min\left(\frac{W}{H},2\right)",
+                    r"R(e^+) &= \left(\frac{P/e}{10}\right)^{0.35}AR_{used}^{m}",
+                    r"&\quad\left[12.31-27.07\left(\frac{\theta}{90}\right)+17.86\left(\frac{\theta}{90}\right)^2\right]",
+                    r"e^+ &= \frac{e}{D_h}Re\sqrt{\frac{f_{rib}}{2}}",
+                    r"f_{rib} &= 0.5\left[R(e^+)-2.5\ln\left(\frac{2e}{D_h}\frac{2W}{W+H}\right)-2.5\right]^{-2}",
+                    r"G(e^+) &= 2.24\left(\frac{W}{H}\right)^{0.1}\left(\frac{\theta}{90}\right)^m\left(\frac{P/e}{10}\right)^{0.1}(e^+)^{0.35}",
+                    r"St &= \frac{f_{rib}/2}{(G(e^+)-R(e^+))\sqrt{f_{rib}/2}+1}",
+                    r"h &= St\,\rho C_p V",
+                    r"\Delta P_{rotation} &= \rho C_{rotation}\left(\frac{RPM\,R_{blade}\pi}{60}\right)^2L",
+                    r"\end{aligned}",
+                )
+            ),
             (
-                "m = 0 for Angle = 90 deg, otherwise m = 0.35\n"
-                "AR_used = min(W / H, 2)\n"
-                "R(e+) = ((P/e)/10)^0.35 * AR_used^m * "
-                "(12.31 - 27.07*(Angle/90) + 17.86*(Angle/90)^2)\n"
-                "e+ = (e/D_h) * Re * sqrt(f_rib / 2)\n"
-                "f_rib = 0.5 * (R(e+) - 2.5*ln((2e/D_h)*(2W/(W+H))) - 2.5)^-2\n"
-                "The f_rib/e+ pair is solved iteratively.\n"
-                "P_loss_friction = f_rib * (L / D_h) * dynamic pressure\n"
-                "P_loss_rotation = rho * C_rotation * (RPM * Radius * pi / 60)^2 * L\n"
-                "G(e+) = 2.24 * (W/H)^0.1 * (Angle/90)^m * ((P/e)/10)^0.1 * e+^0.35\n"
-                "St = (f_rib/2) / ((G(e+) - R(e+))*sqrt(f_rib/2) + 1)\n"
-                "h = St * rho * Cp * V\n\n"
-                "Required inputs: L, W, H, e/D_h, P/e, angle, radius, RPM, "
-                "C_rotation, ribbed wall count."
+                ("Iteration", "f_rib and e+ are solved together; non-convergence is reported"),
+                ("Inputs", "L, W, H, e/D_h, P/e, rib angle, blade radius, RPM, C_rotation"),
             ),
         )
         self._formula_section(
             frame,
             "Turning",
+            "\n".join(
+                (
+                    r"\begin{aligned}",
+                    r"W_{turn} &= \frac{W_{upstream}+W_{downstream}}{2}",
+                    r"H_{turn} &= \frac{H_{upstream}+H_{downstream}}{2}",
+                    r"f_{turning} &= 3f_{smooth}",
+                    r"Nu_{turning} &= C_{Nu}Nu_{DB}",
+                    r"\Delta P_{friction} &= f_{turning}\frac{L}{D_h}q_{dyn}",
+                    r"\end{aligned}",
+                )
+            ),
             (
-                "Turning is used for 90 deg, 180 deg, and similar passage turns.\n"
-                "W and H are automatically taken from the average of the adjacent "
-                "upstream and downstream rectangular channels when available.\n"
-                "f_turning = 3 * f_smooth\n"
-                "P_loss_friction = f_turning * (L / D_h) * dynamic pressure\n"
-                "Nu_turning = C_Nu * Nu_DB\n\n"
-                "Required inputs: L, turn angle, C_Nu. Default C_Nu = 1.5.\n"
-                "Bend radius and turn clearance are not used in this first model."
+                ("Turn angle", "Stored for traceability; current model does not scale by angle"),
+                ("C_Nu", "Default 1.5"),
+                ("Inputs", "L, turn angle, C_Nu"),
             ),
         )
         self._formula_section(
             frame,
             "Pin-Fin Array",
+            "\n".join(
+                (
+                    r"\begin{aligned}",
+                    r"N_{across} &= \left\lfloor\frac{W}{S}\right\rfloor,\quad N_{rows}=\left\lfloor\frac{L}{X}\right\rfloor",
+                    r"A_{min} &= WH - N_{across}D_{pin}\min(H_{pin},H)",
+                    r"V_{max} &= \frac{\dot{m}}{\rho A_{min}}",
+                    r"Re_D &= \frac{\rho V_{max}D_{pin}}{\mu}",
+                    r"f_{pin} &= 4(1.76)Re_D^{-0.318}",
+                    r"Nu &= 0.135Re_D^{0.69}\left(\frac{S}{D_{pin}}\right)^{-0.34}",
+                    r"h &= \frac{Nu\,k_{air}}{D_{pin}}",
+                    r"\Delta P_{friction} &= f_{pin}\frac{L}{D_{pin}}q_{dyn,max}",
+                    r"\end{aligned}",
+                )
+            ),
             (
-                "pins_across = floor(W / S), row_count = floor(L / X)\n"
-                "A_min = W*H - pins_across * D_pin * min(H_pin, H)\n"
-                "V_max = m_dot / (rho * A_min)\n"
-                "Re_D = rho * V_max * D_pin / mu\n"
-                "f_pinfin = 4 * 1.76 * Re_D^-0.318\n"
-                "P_loss_friction = f_pinfin * (L / D_pin) * dynamic pressure based on V_max\n"
-                "Nu = 0.135 * Re_D^0.69 * (S / D_pin)^-0.34\n"
-                "h = Nu * k_air / D_pin\n\n"
-                "Required inputs: L, W, H, D_pin, H_pin, X pitch, S pitch."
+                ("Automatic counts", "pins_across and row_count are calculated from W, L, S, and X"),
+                ("Inputs", "L, W, H, D_pin, H_pin, X pitch, S pitch"),
+            ),
+        )
+        self._formula_section(
+            frame,
+            "Wall / TBC Thermal Network",
+            "\n".join(
+                (
+                    r"\begin{aligned}",
+                    r"R_i &= \frac{1}{h_iA},\quad R_w=\frac{t_w}{k_wA},\quad R_{TBC}=\frac{t_{TBC}}{k_{TBC}A},\quad R_o=\frac{1}{h_oA}",
+                    r"\dot{Q} &= \frac{T_{\infty,o}-T_{fluid}}{R_i+R_w+R_{TBC}+R_o}",
+                    r"T_{wall,i} &= T_{fluid}+\dot{Q}R_i",
+                    r"T_{metal,o} &= T_{wall,i}+\dot{Q}R_w",
+                    r"T_{TBC,o} &= T_{metal,o}+\dot{Q}R_{TBC}",
+                    r"\end{aligned}",
+                )
+            ),
+            (
+                ("Boundary", "External gas convection + TBC conduction + blade wall conduction + internal convection"),
+                ("Inputs", "External gas T, external h, wall thickness/k, TBC thickness/k"),
             ),
         )
 
-    def _formula_section(self, parent: ttk.Frame, title: str, body: str) -> None:
+    def _formula_section(
+        self,
+        parent: ttk.Frame,
+        title: str,
+        equation: str,
+        variables: tuple[tuple[str, str], ...],
+    ) -> None:
         panel = self._panel(parent)
         panel.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(panel, text=title, style="Section.TLabel").pack(
             anchor=tk.W,
             pady=(0, 6),
         )
-        tk.Label(
+        formula = tk.Text(
             panel,
-            text=body,
-            bg=PANEL_BG,
+            height=max(4, equation.count("\n") + 1),
+            wrap=tk.NONE,
+            bg="#fbfcfe",
             fg=TEXT_COLOR,
-            font=("Segoe UI", 13),
-            justify=tk.LEFT,
-            anchor=tk.W,
-            wraplength=1120,
-        ).pack(fill=tk.X, anchor=tk.W)
+            font=("Consolas", 12),
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+        )
+        formula.insert(tk.END, equation)
+        formula.configure(state=tk.DISABLED)
+        formula.pack(fill=tk.X, pady=(0, 8))
+        for name, description in variables:
+            row = ttk.Frame(panel, style="Panel.TFrame")
+            row.pack(fill=tk.X, pady=1)
+            ttk.Label(
+                row,
+                text=name,
+                style="Header.TLabel",
+                width=18,
+                font=("Segoe UI", 11, "bold"),
+            ).pack(side=tk.LEFT)
+            ttk.Label(
+                row,
+                text=description,
+                style="Header.TLabel",
+                wraplength=940,
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _build_results_tab(self) -> None:
         notebook = ttk.Notebook(self.results_tab)
@@ -1764,6 +1968,8 @@ class PassageApp(tk.Tk):
             "f",
             "dp",
             "q",
+            "qflux",
+            "twall",
             "tout",
             "pout",
         )
@@ -1780,6 +1986,8 @@ class PassageApp(tk.Tk):
             "f": "f_D",
             "dp": "dp [Pa]",
             "q": "q [W]",
+            "qflux": "q'' [W/m2]",
+            "twall": "Twall,i [K]",
             "tout": "Tout [K]",
             "pout": "Pout [Pa]",
         }
@@ -1793,6 +2001,8 @@ class PassageApp(tk.Tk):
             "f": 80,
             "dp": 110,
             "q": 110,
+            "qflux": 115,
+            "twall": 105,
             "tout": 95,
             "pout": 110,
         }
@@ -1860,8 +2070,28 @@ class PassageApp(tk.Tk):
         self._auto_apply_edge_form()
 
     def _on_wall_mode_change(self, *_args: object) -> None:
+        self._apply_wall_defaults()
         self._update_wall_field_visibility()
         self._auto_apply_edge_form()
+
+    def _apply_wall_defaults(self) -> None:
+        if self._edge_vars["wall_mode"].get() != "external_convection":
+            return
+        defaults = {
+            "external_temperature": "1,150",
+            "external_htc": "1,200",
+            "wall_thickness": "0.0015",
+            "wall_conductivity": "18",
+            "tbc_thickness": "0.00025",
+            "tbc_conductivity": "1.2",
+        }
+        self._suppress_auto_apply = True
+        try:
+            for key, value in defaults.items():
+                if not self._edge_vars[key].get().strip():
+                    self._edge_vars[key].set(value)
+        finally:
+            self._suppress_auto_apply = False
 
     def _on_node_kind_change(self, *_args: object) -> None:
         self._update_node_field_visibility()
@@ -1927,7 +2157,12 @@ class PassageApp(tk.Tk):
         visible = {
             "wall_temperature": wall_mode == "wall_temperature",
             "heat_flux": wall_mode == "heat_flux",
-            "external_htc": wall_mode == "heat_flux",
+            "external_temperature": wall_mode == "external_convection",
+            "external_htc": wall_mode == "external_convection",
+            "wall_thickness": wall_mode == "external_convection",
+            "wall_conductivity": wall_mode == "external_convection",
+            "tbc_thickness": wall_mode == "external_convection",
+            "tbc_conductivity": wall_mode == "external_convection",
         }
         for key, widgets in self.edge_wall_fields.items():
             for widget in widgets:
@@ -1990,6 +2225,7 @@ class PassageApp(tk.Tk):
             self.selected_edge_id = None
         finally:
             self._suppress_auto_apply = False
+        self._update_selected_result_panel()
         self._after_apply()
 
     def _refresh_after_auto_edge_change(self, index: int) -> None:
@@ -2002,6 +2238,7 @@ class PassageApp(tk.Tk):
             self.edge_tree.focus(str(index))
         finally:
             self._suppress_auto_apply = False
+        self._update_selected_result_panel()
         self._after_apply()
 
     def _apply_param_defaults(self, technology: str) -> None:
@@ -2131,6 +2368,7 @@ class PassageApp(tk.Tk):
             self.selected_node_id = self.node_rows[index]["node_id"]
             self.selected_edge_id = None
             self._populate_node_form(index)
+            self._update_selected_result_panel()
             self._redraw_layout_canvas()
 
     def _on_edge_select(self, _event: tk.Event) -> None:
@@ -2139,6 +2377,7 @@ class PassageApp(tk.Tk):
             self.selected_edge_id = self.edge_rows[index]["edge_id"]
             self.selected_node_id = None
             self._populate_edge_form(index)
+            self._update_selected_result_panel()
             self._redraw_layout_canvas()
 
     def _populate_node_form(self, index: int) -> None:
@@ -2244,6 +2483,7 @@ class PassageApp(tk.Tk):
         self._refresh_edge_tree()
         self._refresh_node_combos()
         self._update_dashboard_summary()
+        self._update_selected_result_panel()
         self._redraw_layout_canvas()
 
     def apply_edge(self) -> None:
@@ -2299,6 +2539,7 @@ class PassageApp(tk.Tk):
         self.selected_edge_id = None
         self._refresh_edge_tree()
         self._update_dashboard_summary()
+        self._update_selected_result_panel()
 
     def _edge_form_to_row(self) -> dict[str, str]:
         row = {key: variable.get().strip() for key, variable in self._edge_vars.items()}
@@ -2317,7 +2558,13 @@ class PassageApp(tk.Tk):
             row["wall_temperature"] = ""
         if row["wall_mode"] != "heat_flux":
             row["heat_flux"] = ""
+        if row["wall_mode"] != "external_convection":
+            row["external_temperature"] = ""
             row["external_htc"] = ""
+            row["wall_thickness"] = ""
+            row["wall_conductivity"] = ""
+            row["tbc_thickness"] = ""
+            row["tbc_conductivity"] = ""
         row["flow_fraction"] = ""
         row["fixed_mdot"] = ""
         for key, variable in self._tech_param_vars.items():
@@ -2412,6 +2659,11 @@ class PassageApp(tk.Tk):
                 wall_temperature=_optional_float(row["wall_temperature"]),
                 heat_flux=_optional_float(row["heat_flux"]),
                 external_htc=_optional_float(row["external_htc"]),
+                external_temperature=_optional_float(row["external_temperature"]),
+                wall_thickness=_optional_float(row["wall_thickness"]),
+                wall_conductivity=_optional_float(row["wall_conductivity"]),
+                tbc_thickness=_optional_float(row["tbc_thickness"]),
+                tbc_conductivity=_optional_float(row["tbc_conductivity"]),
             )
             edges.append(
                 EdgeSpec(
@@ -2458,10 +2710,128 @@ class PassageApp(tk.Tk):
                     _fmt_number(edge.friction_factor_darcy, 5),
                     _fmt_number(edge.dp_total, 1),
                     _fmt_number(edge.heat_rate, 1),
+                    _fmt_number(float(edge.intermediate.get("heat_flux_w_m2", 0.0)), 1),
+                    _fmt_optional(edge.intermediate.get("coolant_side_wall_temperature_k")),
                     _fmt_number(edge.outlet_temperature, 2),
                     _fmt_number(edge.outlet_pressure, 1),
                 ),
             )
+        self._update_selected_result_panel()
+        self._redraw_layout_canvas()
+
+    def _update_selected_result_panel(self) -> None:
+        if not hasattr(self, "selected_result_text"):
+            return
+        self.selected_result_text.configure(state=tk.NORMAL)
+        self.selected_result_text.delete("1.0", tk.END)
+        self.wall_stack_canvas.delete(tk.ALL)
+        if self.last_result is None:
+            self.selected_result_text.insert(tk.END, "Run calculation to view edge results.")
+            self.selected_result_text.configure(state=tk.DISABLED)
+            self._draw_wall_stack_placeholder("No result")
+            return
+        if not self.selected_edge_id or self.selected_edge_id not in self.last_result.edges:
+            self.selected_result_text.insert(tk.END, "Select an edge on the layout or table.")
+            self.selected_result_text.configure(state=tk.DISABLED)
+            self._draw_wall_stack_placeholder("Select edge")
+            return
+
+        edge = self.last_result.edges[self.selected_edge_id]
+        info = edge.intermediate
+        lines = [
+            f"Edge: {edge.edge_id} ({edge.from_node} -> {edge.to_node})",
+            f"Technology: {edge.cooling_technology}",
+            f"m_dot: {_fmt_number(edge.mass_flow, 6)} kg/s",
+            f"Tout: {_fmt_number(edge.outlet_temperature, 2)} K, Pout: {_fmt_number(edge.outlet_pressure, 1)} Pa",
+            f"Re: {_fmt_number(edge.reynolds, 0)}, Nu: {_fmt_number(edge.nusselt, 2)}, h: {_fmt_number(edge.htc, 1)} W/m2-K",
+            f"dp friction: {_fmt_number(edge.dp_friction, 1)} Pa, dp rotation: {_fmt_number(edge.dp_rotation, 1)} Pa",
+            f"q: {_fmt_number(edge.heat_rate, 1)} W, q'': {_fmt_number(float(info.get('heat_flux_w_m2', 0.0)), 1)} W/m2",
+        ]
+        if info.get("wall_mode") == "external_convection":
+            lines.extend(
+                [
+                    f"External gas T: {_fmt_number(float(info['external_temperature_k']), 2)} K",
+                    f"TBC outer / metal outer / coolant wall: "
+                    f"{_fmt_number(float(info['tbc_outer_temperature_k']), 2)} / "
+                    f"{_fmt_number(float(info['metal_outer_temperature_k']), 2)} / "
+                    f"{_fmt_number(float(info['coolant_side_wall_temperature_k']), 2)} K",
+                    f"R total: {_fmt_number(float(info['r_total_k_w']), 6)} K/W",
+                ]
+            )
+        self.selected_result_text.insert(tk.END, "\n".join(lines))
+        self.selected_result_text.configure(state=tk.DISABLED)
+        self._draw_wall_stack(edge.intermediate)
+
+    def _draw_wall_stack_placeholder(self, text: str) -> None:
+        canvas = self.wall_stack_canvas
+        canvas.create_text(
+            max(canvas.winfo_width(), 360) / 2,
+            72,
+            text=text,
+            fill=MUTED_COLOR,
+            font=("Segoe UI", 12, "bold"),
+        )
+
+    def _draw_wall_stack(self, info: dict[str, Any]) -> None:
+        canvas = self.wall_stack_canvas
+        width = max(canvas.winfo_width(), 420)
+        height = max(canvas.winfo_height(), 150)
+        if info.get("wall_mode") != "external_convection":
+            label = "Wall stack is available for external_convection mode."
+            if "coolant_side_wall_temperature_k" in info:
+                label = (
+                    "Coolant-side wall T: "
+                    f"{_fmt_number(float(info['coolant_side_wall_temperature_k']), 2)} K"
+                )
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text=label,
+                fill=MUTED_COLOR,
+                font=("Segoe UI", 11, "bold"),
+            )
+            return
+
+        layers = [
+            ("Gas", float(info["external_temperature_k"])),
+            ("TBC outer", float(info["tbc_outer_temperature_k"])),
+            ("Metal outer", float(info["metal_outer_temperature_k"])),
+            ("Coolant wall", float(info["coolant_side_wall_temperature_k"])),
+            ("Coolant bulk", float(info["fluid_reference_temperature_k"])),
+        ]
+        values = [temperature for _label, temperature in layers]
+        margin = 16
+        gap = 6
+        usable_width = width - 2 * margin
+        block_width = (usable_width - gap * (len(layers) - 1)) / len(layers)
+        y0, y1 = 38, 104
+        for index, (label, temperature) in enumerate(layers):
+            x0 = margin + index * (block_width + gap)
+            x1 = x0 + block_width
+            fill = _value_to_color(temperature, values)
+            canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline=BORDER_COLOR)
+            canvas.create_text(
+                (x0 + x1) / 2,
+                y0 + 20,
+                text=label,
+                fill=TEXT_COLOR,
+                font=("Segoe UI", 9, "bold"),
+            )
+            canvas.create_text(
+                (x0 + x1) / 2,
+                y0 + 44,
+                text=f"{temperature:,.1f} K",
+                fill=TEXT_COLOR,
+                font=("Segoe UI", 9),
+            )
+        canvas.create_text(
+            margin,
+            18,
+            text="1D thermal resistance stack: external gas -> TBC -> blade wall -> coolant",
+            anchor=tk.W,
+            fill=MUTED_COLOR,
+            font=("Segoe UI", 10, "bold"),
+        )
 
     def _update_dashboard_summary(self) -> None:
         if not hasattr(self, "_summary_labels"):
@@ -2496,6 +2866,7 @@ class PassageApp(tk.Tk):
             self._set_dashboard_status("READY", SAFE_COLOR, "#e7f3ec")
         if hasattr(self, "dashboard_warning_text"):
             self._set_dashboard_warning_text(["No calculation has been run yet."])
+        self._update_selected_result_panel()
 
     def _show_dashboard(self, result: SolverResult) -> None:
         self._update_dashboard_summary()
@@ -2678,6 +3049,11 @@ def _edge_to_row(edge: EdgeSpec) -> dict[str, str]:
             "wall_temperature": _fmt_optional(edge.wall.wall_temperature),
             "heat_flux": _fmt_optional(edge.wall.heat_flux),
             "external_htc": _fmt_optional(edge.wall.external_htc),
+            "external_temperature": _fmt_optional(edge.wall.external_temperature),
+            "wall_thickness": _fmt_optional(edge.wall.wall_thickness),
+            "wall_conductivity": _fmt_optional(edge.wall.wall_conductivity),
+            "tbc_thickness": _fmt_optional(edge.wall.tbc_thickness),
+            "tbc_conductivity": _fmt_optional(edge.wall.tbc_conductivity),
             "flow_fraction": _fmt_optional(edge.flow_fraction),
             "fixed_mdot": _fmt_optional(edge.fixed_mdot),
             "params_text": _format_params(additional_params),
@@ -2741,6 +3117,33 @@ def _auto_node_positions(node_ids: list[str]) -> dict[str, tuple[float, float]]:
 
 def _clamp01(value: float) -> float:
     return min(1.0, max(0.0, value))
+
+
+def _value_to_color(value: float, values: list[float]) -> str:
+    if not values:
+        return ACCENT_COLOR
+    low = min(values)
+    high = max(values)
+    if high <= low:
+        fraction = 0.5
+    else:
+        fraction = (value - low) / (high - low)
+    fraction = _clamp01(fraction)
+    if fraction < 0.5:
+        local = fraction / 0.5
+        return _interpolate_color("#2f80ed", "#f2c94c", local)
+    return _interpolate_color("#f2c94c", "#d7191c", (fraction - 0.5) / 0.5)
+
+
+def _interpolate_color(start: str, end: str, fraction: float) -> str:
+    fraction = _clamp01(fraction)
+    start_rgb = tuple(int(start[index:index + 2], 16) for index in (1, 3, 5))
+    end_rgb = tuple(int(end[index:index + 2], 16) for index in (1, 3, 5))
+    rgb = tuple(
+        round(start_value + (end_value - start_value) * fraction)
+        for start_value, end_value in zip(start_rgb, end_rgb)
+    )
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
 
 
 def _point_to_segment_distance(
@@ -2875,6 +3278,10 @@ def _write_result_csv(path: Path, result: SolverResult) -> None:
                 "dp_rotation_pa",
                 "dp_total_pa",
                 "q_w",
+                "heat_flux_w_m2",
+                "coolant_side_wall_temperature_k",
+                "metal_outer_temperature_k",
+                "tbc_outer_temperature_k",
                 "tout_k",
                 "pout_pa",
             ]
@@ -2895,6 +3302,10 @@ def _write_result_csv(path: Path, result: SolverResult) -> None:
                     edge.dp_rotation,
                     edge.dp_total,
                     edge.heat_rate,
+                    edge.intermediate.get("heat_flux_w_m2"),
+                    edge.intermediate.get("coolant_side_wall_temperature_k"),
+                    edge.intermediate.get("metal_outer_temperature_k"),
+                    edge.intermediate.get("tbc_outer_temperature_k"),
                     edge.outlet_temperature,
                     edge.outlet_pressure,
                 ]

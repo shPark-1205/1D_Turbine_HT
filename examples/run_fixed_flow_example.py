@@ -30,7 +30,8 @@ def main() -> None:
     print("\nEdge results")
     print(
         "edge, tech, Re, Nu, h[W/m2-K], f_D, "
-        "dp_friction[Pa], dp_rotation[Pa], dp_total[Pa], q[W], Tout[K]"
+        "dp_friction[Pa], dp_rotation[Pa], dp_total[Pa], "
+        "q[W], qflux[W/m2], Twall_i[K], Tout[K]"
     )
     for edge_id, edge in result.edges.items():
         print(
@@ -38,7 +39,10 @@ def main() -> None:
             f"{edge.nusselt:.2f}, {edge.htc:.2f}, "
             f"{edge.friction_factor_darcy:.5f}, {edge.dp_friction:.1f}, "
             f"{edge.dp_rotation:.1f}, {edge.dp_total:.1f}, "
-            f"{edge.heat_rate:.1f}, {edge.outlet_temperature:.2f}"
+            f"{edge.heat_rate:.1f}, "
+            f"{edge.intermediate.get('heat_flux_w_m2', 0.0):.1f}, "
+            f"{edge.intermediate.get('coolant_side_wall_temperature_k', 0.0):.2f}, "
+            f"{edge.outlet_temperature:.2f}"
         )
 
     if result.warnings:

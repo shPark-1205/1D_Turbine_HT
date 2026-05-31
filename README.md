@@ -16,6 +16,8 @@ The first version focuses on:
 - smooth, rib, turning, and pin-fin correlations
 - rib rotation pressure-loss correction
 - automatic pin-fin row/across-count calculation from channel and pitch geometry
+- external gas convection, TBC conduction, blade wall conduction, and internal
+  cooling convection coupled as a 1D thermal resistance network
 
 ## Run the example
 
@@ -42,8 +44,12 @@ the right side of the same screen. Use `Add Node` to place a node by clicking on
 the image, and `Connect Nodes` to create an edge by clicking a source node and a
 target node. The `Technology` field controls which cooling-technology
 parameters are shown. The `Correlations` tab summarizes the pressure-drop and
-heat-transfer equations used by the current prototype. Full calculation results
-and warnings remain available in separate result tabs.
+heat-transfer equations used by the current prototype. The layout overlay can
+color edges or nodes by outlet temperature, HTC, pressure drop, heat transfer,
+node temperature, or node pressure. Selecting an edge shows a compact result
+summary plus the wall/TBC/coolant temperature stack when external convection is
+used. Full calculation results and warnings remain available in separate result
+tabs.
 
 ## Install Optional Dependencies
 
@@ -107,4 +113,7 @@ python -m unittest discover -s tests
   factor.
 - Pin-fin row count and pins across the channel are calculated from channel
   length, channel width, and pin pitch.
+- `external_convection` wall mode computes heat transfer with
+  `R_i + R_wall + R_TBC + R_o`, using the same thermal area as the internal
+  cooling correlation in this first implementation.
 - Internal calculations are SI.

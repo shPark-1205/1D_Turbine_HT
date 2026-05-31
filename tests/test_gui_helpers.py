@@ -41,6 +41,9 @@ class GuiHelperTest(unittest.TestCase):
         self.assertEqual(row[_param_row_key("e_over_dh")], "0.069")
         self.assertEqual(row[_param_row_key("p_over_e")], "11")
         self.assertEqual(row[_param_row_key("angle_deg")], "45")
+        self.assertEqual(row["wall_mode"], "external_convection")
+        self.assertEqual(row["external_temperature"], "1,150")
+        self.assertEqual(row["tbc_conductivity"], "1.2")
         self.assertEqual(row["params_text"], "")
 
     def test_params_from_row_merges_visible_fields_and_extra_params(self) -> None:
