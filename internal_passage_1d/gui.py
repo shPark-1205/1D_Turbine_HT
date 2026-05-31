@@ -12,6 +12,13 @@ except ImportError:  # pragma: no cover - exercised only when Pillow is absent.
     Image = None
     ImageTk = None
 
+try:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+except ImportError:  # pragma: no cover - text fallback is used when absent.
+    Figure = None
+    FigureCanvasAgg = None
+
 from .models import (
     EdgeSpec,
     Geometry,
@@ -134,6 +141,9 @@ class PassageApp(tk.Tk):
         self._drag_node_id: str | None = None
         self._drag_started = False
         self._workspace_scroll_canvas: tk.Canvas | None = None
+        self._correlations_scroll_canvas: tk.Canvas | None = None
+        self._formula_images: list[Any] = []
+        self.results_stale = False
 
         self.property_model = tk.StringVar(value="ideal_gas")
         self.overlay_metric = tk.StringVar(value="Technology")
@@ -181,9 +191,7 @@ class PassageApp(tk.Tk):
         self._edge_vars["shape"].trace_add("write", self._on_shape_change)
         self._edge_vars["wall_mode"].trace_add("write", self._on_wall_mode_change)
         self._node_vars["kind"].trace_add("write", self._on_node_kind_change)
-        self.property_model.trace_add(
-            "write", lambda *_args: self._update_dashboard_summary()
-        )
+        self.property_model.trace_add("write", self._on_property_model_change)
         self.overlay_metric.trace_add(
             "write", lambda *_args: self._redraw_layout_canvas()
         )
@@ -677,18 +685,22 @@ class PassageApp(tk.Tk):
             text="Selected Edge Result",
             style="Section.TLabel",
         ).pack(anchor=tk.W, pady=(0, 8))
-        self.selected_result_text = tk.Text(
+        self.selected_result_tree = ttk.Treeview(
             result_panel,
-            height=8,
-            wrap=tk.WORD,
-            bg="#fbfcfe",
-            fg=TEXT_COLOR,
-            font=("Segoe UI", 11),
-            relief=tk.FLAT,
-            padx=8,
-            pady=8,
+            columns=("item", "value"),
+            show="headings",
+            height=10,
         )
-        self.selected_result_text.pack(fill=tk.X)
+        self.selected_result_tree.heading("item", text="Item")
+        self.selected_result_tree.heading("value", text="Value")
+        self.selected_result_tree.column("item", width=170, anchor=tk.W)
+        self.selected_result_tree.column("value", width=270, anchor=tk.W)
+        self.selected_result_tree.tag_configure(
+            "stale",
+            background="#fff4df",
+            foreground=WARNING_COLOR,
+        )
+        self.selected_result_tree.pack(fill=tk.X)
         self.wall_stack_canvas = tk.Canvas(
             result_panel,
             height=150,
@@ -918,6 +930,26 @@ class PassageApp(tk.Tk):
         canvas = self._workspace_scroll_canvas
         if canvas is None:
             return
+        if str(self.notebook.select()) != str(self.workspace_tab):
+            return
+        pointer_x = canvas.winfo_pointerx()
+        pointer_y = canvas.winfo_pointery()
+        left = canvas.winfo_rootx()
+        top = canvas.winfo_rooty()
+        right = left + canvas.winfo_width()
+        bottom = top + canvas.winfo_height()
+        if not (left <= pointer_x <= right and top <= pointer_y <= bottom):
+            return
+        delta = getattr(event, "delta", 0)
+        if delta:
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+    def _on_correlations_mousewheel(self, event: tk.Event) -> None:
+        canvas = self._correlations_scroll_canvas
+        if canvas is None:
+            return
+        if str(self.notebook.select()) != str(self.correlations_tab):
+            return
         pointer_x = canvas.winfo_pointerx()
         pointer_y = canvas.winfo_pointery()
         left = canvas.winfo_rootx()
@@ -1116,6 +1148,7 @@ class PassageApp(tk.Tk):
         self._draw_layout_background(canvas, width, height)
         self._draw_layout_edges(canvas)
         self._draw_layout_nodes(canvas)
+        self._draw_stale_banner(canvas)
 
     def _draw_layout_background(
         self,
@@ -1180,6 +1213,28 @@ class PassageApp(tk.Tk):
         )
         self._layout_image_bbox = (x0, y0, display_width, display_height)
 
+    def _draw_stale_banner(self, canvas: tk.Canvas) -> None:
+        if not self.results_stale:
+            return
+        text = "OLD DATA - inputs changed. Press Calculate."
+        canvas.create_rectangle(
+            24,
+            24,
+            350,
+            58,
+            fill="#fff4df",
+            outline=WARNING_COLOR,
+            width=2,
+        )
+        canvas.create_text(
+            36,
+            41,
+            text=text,
+            anchor=tk.W,
+            fill=WARNING_COLOR,
+            font=("Segoe UI", 11, "bold"),
+        )
+
     def _draw_layout_edges(self, canvas: tk.Canvas) -> None:
         metric = self.overlay_metric.get() if hasattr(self, "overlay_metric") else "Technology"
         metric_values = self._overlay_edge_values(metric)
@@ -1207,20 +1262,27 @@ class PassageApp(tk.Tk):
             )
             mid_x = (x1 + x2) / 2
             mid_y = (y1 + y2) / 2
+            label = self._edge_overlay_label(row, metric, overlay_value)
+            label_fill = "#ffffff"
+            label_text = TEXT_COLOR
+            if overlay_value is not None:
+                label_fill = WARNING_COLOR if is_selected else color
+                label_text = _contrast_text_color(label_fill)
+            label_half_width = max(34, 4.4 * len(label) + 8)
             canvas.create_rectangle(
-                mid_x - 28,
-                mid_y - 12,
-                mid_x + 28,
-                mid_y + 12,
-                fill="#fff8e8" if is_selected else "#ffffff",
+                mid_x - label_half_width,
+                mid_y - 13,
+                mid_x + label_half_width,
+                mid_y + 13,
+                fill="#fff8e8" if is_selected and overlay_value is None else label_fill,
                 outline=WARNING_COLOR if is_selected else BORDER_COLOR,
             )
             canvas.create_text(
                 mid_x,
                 mid_y,
-                text=self._edge_overlay_label(row, metric, overlay_value),
-                fill=TEXT_COLOR,
-                font=("Segoe UI", 8, "bold"),
+                text=label,
+                fill=TEXT_COLOR if is_selected and overlay_value is None else label_text,
+                font=("Segoe UI", 9, "bold"),
             )
 
     def _draw_layout_nodes(self, canvas: tk.Canvas) -> None:
@@ -1236,8 +1298,10 @@ class PassageApp(tk.Tk):
             is_selected = node_id == self.selected_node_id
             overlay_value = metric_values.get(node_id)
             fill = _value_to_color(overlay_value, list(metric_values.values())) if overlay_value is not None else "#ffffff"
+            text_fill = _contrast_text_color(fill) if overlay_value is not None else TEXT_COLOR
             if is_selected:
                 fill = "#fff8e8"
+                text_fill = TEXT_COLOR
             outline = ACCENT_COLOR
             if row["kind"] == "inlet":
                 outline = SAFE_COLOR
@@ -1260,7 +1324,7 @@ class PassageApp(tk.Tk):
                 x,
                 y,
                 text=node_id,
-                fill=TEXT_COLOR,
+                fill=text_fill,
                 font=("Segoe UI", 11, "bold"),
             )
 
@@ -1761,6 +1825,8 @@ class PassageApp(tk.Tk):
 
         frame.bind("<Configure>", resize_scroll_region)
         canvas.bind("<Configure>", resize_width)
+        self._correlations_scroll_canvas = canvas
+        self.bind_all("<MouseWheel>", self._on_correlations_mousewheel, add="+")
 
         self._formula_section(
             frame,
@@ -1804,7 +1870,7 @@ class PassageApp(tk.Tk):
             "\n".join(
                 (
                     r"\begin{aligned}",
-                    r"m &= \begin{cases}0,&\theta=90^\circ\\0.35,&\theta<90^\circ\end{cases}",
+                    r"m=0\;(\theta=90^\circ),\quad m=0.35\;(\theta<90^\circ)",
                     r"AR_{used} &= \min\left(\frac{W}{H},2\right)",
                     r"R(e^+) &= \left(\frac{P/e}{10}\right)^{0.35}AR_{used}^{m}",
                     r"&\quad\left[12.31-27.07\left(\frac{\theta}{90}\right)+17.86\left(\frac{\theta}{90}\right)^2\right]",
@@ -1897,20 +1963,32 @@ class PassageApp(tk.Tk):
             anchor=tk.W,
             pady=(0, 6),
         )
-        formula = tk.Text(
-            panel,
-            height=max(4, equation.count("\n") + 1),
-            wrap=tk.NONE,
-            bg="#fbfcfe",
-            fg=TEXT_COLOR,
-            font=("Consolas", 12),
-            relief=tk.FLAT,
-            padx=8,
-            pady=8,
-        )
-        formula.insert(tk.END, equation)
-        formula.configure(state=tk.DISABLED)
-        formula.pack(fill=tk.X, pady=(0, 8))
+        formula_image = self._create_formula_image(_math_lines(equation))
+        if formula_image is not None:
+            self._formula_images.append(formula_image)
+            tk.Label(
+                panel,
+                image=formula_image,
+                bg="#fbfcfe",
+                anchor=tk.W,
+                padx=8,
+                pady=8,
+            ).pack(fill=tk.X, pady=(0, 8))
+        else:
+            formula = tk.Text(
+                panel,
+                height=max(4, equation.count("\n") + 1),
+                wrap=tk.NONE,
+                bg="#fbfcfe",
+                fg=TEXT_COLOR,
+                font=("Consolas", 12),
+                relief=tk.FLAT,
+                padx=8,
+                pady=8,
+            )
+            formula.insert(tk.END, equation)
+            formula.configure(state=tk.DISABLED)
+            formula.pack(fill=tk.X, pady=(0, 8))
         for name, description in variables:
             row = ttk.Frame(panel, style="Panel.TFrame")
             row.pack(fill=tk.X, pady=1)
@@ -1927,6 +2005,42 @@ class PassageApp(tk.Tk):
                 style="Header.TLabel",
                 wraplength=940,
             ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _create_formula_image(self, lines: list[str]) -> Any | None:
+        if Figure is None or FigureCanvasAgg is None or Image is None or ImageTk is None:
+            return None
+        if not lines:
+            return None
+        height = max(0.58 * len(lines) + 0.18, 1.0)
+        figure = Figure(figsize=(9.4, height), dpi=130, facecolor="#fbfcfe")
+        axis = figure.add_axes((0, 0, 1, 1))
+        axis.set_axis_off()
+        line_step = 1.0 / max(len(lines), 1)
+        for index, line in enumerate(lines):
+            axis.text(
+                0.02,
+                0.98 - index * line_step,
+                f"${line}$",
+                fontsize=15,
+                va="top",
+                color=TEXT_COLOR,
+            )
+        canvas = FigureCanvasAgg(figure)
+        try:
+            canvas.draw()
+            width, height_px = canvas.get_width_height()
+            image = Image.frombuffer(
+                "RGBA",
+                (width, height_px),
+                canvas.buffer_rgba(),
+                "raw",
+                "RGBA",
+                0,
+                1,
+            ).copy()
+            return ImageTk.PhotoImage(image)
+        except Exception:
+            return None
 
     def _build_results_tab(self) -> None:
         notebook = ttk.Notebook(self.results_tab)
@@ -2073,6 +2187,11 @@ class PassageApp(tk.Tk):
         self._apply_wall_defaults()
         self._update_wall_field_visibility()
         self._auto_apply_edge_form()
+
+    def _on_property_model_change(self, *_args: object) -> None:
+        self._update_dashboard_summary()
+        if hasattr(self, "notebook"):
+            self._mark_results_stale()
 
     def _apply_wall_defaults(self) -> None:
         if self._edge_vars["wall_mode"].get() != "external_convection":
@@ -2462,6 +2581,7 @@ class PassageApp(tk.Tk):
         index = len(self.node_rows) - 1
         self.node_tree.selection_set(str(index))
         self._populate_node_form(index)
+        self._after_apply()
 
     def delete_node(self) -> None:
         index = self._selected_index(self.node_tree)
@@ -2485,6 +2605,7 @@ class PassageApp(tk.Tk):
         self._update_dashboard_summary()
         self._update_selected_result_panel()
         self._redraw_layout_canvas()
+        self._after_apply()
 
     def apply_edge(self) -> None:
         index = self._selected_index(self.edge_tree)
@@ -2529,6 +2650,7 @@ class PassageApp(tk.Tk):
         index = len(self.edge_rows) - 1
         self.edge_tree.selection_set(str(index))
         self._populate_edge_form(index)
+        self._after_apply()
 
     def delete_edge(self) -> None:
         index = self._selected_index(self.edge_tree)
@@ -2540,6 +2662,7 @@ class PassageApp(tk.Tk):
         self._refresh_edge_tree()
         self._update_dashboard_summary()
         self._update_selected_result_panel()
+        self._after_apply()
 
     def _edge_form_to_row(self) -> dict[str, str]:
         row = {key: variable.get().strip() for key, variable in self._edge_vars.items()}
@@ -2575,6 +2698,19 @@ class PassageApp(tk.Tk):
     def _after_apply(self) -> None:
         if self.auto_calculate.get():
             self.calculate(show_success=False)
+        else:
+            self._mark_results_stale()
+
+    def _mark_results_stale(self) -> None:
+        if self.last_result is None:
+            return
+        self.results_stale = True
+        self._set_dashboard_status("OLD DATA", WARNING_COLOR, "#fff4df")
+        self._set_dashboard_warning_text(
+            ["Inputs changed after the last calculation. Press Calculate to refresh results."]
+        )
+        self._update_selected_result_panel()
+        self._redraw_layout_canvas()
 
     def calculate(self, show_success: bool = True) -> None:
         try:
@@ -2614,6 +2750,7 @@ class PassageApp(tk.Tk):
             return
 
         self.last_result = result
+        self.results_stale = False
         self._show_results(result)
         self._show_dashboard(result)
         self._show_warnings(result.warnings)
@@ -2626,6 +2763,7 @@ class PassageApp(tk.Tk):
         show_success: bool,
     ) -> None:
         self.last_result = None
+        self.results_stale = False
         self._show_dashboard_empty()
         self._set_dashboard_status("FAILED", DANGER_COLOR, "#fde7ea")
         self._set_dashboard_warning_text([f"Calculation failed: {exc}"])
@@ -2720,47 +2858,71 @@ class PassageApp(tk.Tk):
         self._redraw_layout_canvas()
 
     def _update_selected_result_panel(self) -> None:
-        if not hasattr(self, "selected_result_text"):
+        if not hasattr(self, "selected_result_tree"):
             return
-        self.selected_result_text.configure(state=tk.NORMAL)
-        self.selected_result_text.delete("1.0", tk.END)
+        self.selected_result_tree.delete(*self.selected_result_tree.get_children())
         self.wall_stack_canvas.delete(tk.ALL)
         if self.last_result is None:
-            self.selected_result_text.insert(tk.END, "Run calculation to view edge results.")
-            self.selected_result_text.configure(state=tk.DISABLED)
+            self._set_selected_result_rows(
+                [("Status", "Run calculation to view edge results.")]
+            )
             self._draw_wall_stack_placeholder("No result")
             return
         if not self.selected_edge_id or self.selected_edge_id not in self.last_result.edges:
-            self.selected_result_text.insert(tk.END, "Select an edge on the layout or table.")
-            self.selected_result_text.configure(state=tk.DISABLED)
+            rows = []
+            if self.results_stale:
+                rows.append(("Status", "OLD DATA - inputs changed after last calculation."))
+            rows.append(("Selection", "Select an edge on the layout or table."))
+            self._set_selected_result_rows(rows)
             self._draw_wall_stack_placeholder("Select edge")
             return
 
         edge = self.last_result.edges[self.selected_edge_id]
         info = edge.intermediate
-        lines = [
-            f"Edge: {edge.edge_id} ({edge.from_node} -> {edge.to_node})",
-            f"Technology: {edge.cooling_technology}",
-            f"m_dot: {_fmt_number(edge.mass_flow, 6)} kg/s",
-            f"Tout: {_fmt_number(edge.outlet_temperature, 2)} K, Pout: {_fmt_number(edge.outlet_pressure, 1)} Pa",
-            f"Re: {_fmt_number(edge.reynolds, 0)}, Nu: {_fmt_number(edge.nusselt, 2)}, h: {_fmt_number(edge.htc, 1)} W/m2-K",
-            f"dp friction: {_fmt_number(edge.dp_friction, 1)} Pa, dp rotation: {_fmt_number(edge.dp_rotation, 1)} Pa",
-            f"q: {_fmt_number(edge.heat_rate, 1)} W, q'': {_fmt_number(float(info.get('heat_flux_w_m2', 0.0)), 1)} W/m2",
-        ]
-        if info.get("wall_mode") == "external_convection":
-            lines.extend(
-                [
-                    f"External gas T: {_fmt_number(float(info['external_temperature_k']), 2)} K",
-                    f"TBC outer / metal outer / coolant wall: "
-                    f"{_fmt_number(float(info['tbc_outer_temperature_k']), 2)} / "
-                    f"{_fmt_number(float(info['metal_outer_temperature_k']), 2)} / "
-                    f"{_fmt_number(float(info['coolant_side_wall_temperature_k']), 2)} K",
-                    f"R total: {_fmt_number(float(info['r_total_k_w']), 6)} K/W",
-                ]
+        rows = []
+        if self.results_stale:
+            rows.append(("Status", "OLD DATA - press Calculate to refresh."))
+        rows.extend([
+            ("Edge", f"{edge.edge_id} ({edge.from_node} -> {edge.to_node})"),
+            ("Technology", edge.cooling_technology),
+            ("m_dot [kg/s]", _fmt_number(edge.mass_flow, 6)),
+            ("Tout [K]", _fmt_number(edge.outlet_temperature, 2)),
+            ("Pout [Pa]", _fmt_number(edge.outlet_pressure, 1)),
+            ("Re [-]", _fmt_number(edge.reynolds, 0)),
+            ("Nu [-]", _fmt_number(edge.nusselt, 2)),
+            ("h [W/m2-K]", _fmt_number(edge.htc, 1)),
+            ("dp friction [Pa]", _fmt_number(edge.dp_friction, 1)),
+            ("dp rotation [Pa]", _fmt_number(edge.dp_rotation, 1)),
+            ("q [W]", _fmt_number(edge.heat_rate, 1)),
+            ("q'' [W/m2]", _fmt_number(float(info.get("heat_flux_w_m2", 0.0)), 1)),
+        ])
+        if "coolant_side_wall_temperature_k" in info:
+            rows.append(
+                (
+                    "Coolant wall T [K]",
+                    _fmt_number(float(info["coolant_side_wall_temperature_k"]), 2),
+                )
             )
-        self.selected_result_text.insert(tk.END, "\n".join(lines))
-        self.selected_result_text.configure(state=tk.DISABLED)
+        if info.get("wall_mode") == "external_convection":
+            rows.extend([
+                ("External gas T [K]", _fmt_number(float(info["external_temperature_k"]), 2)),
+                ("TBC outer T [K]", _fmt_number(float(info["tbc_outer_temperature_k"]), 2)),
+                ("Metal outer T [K]", _fmt_number(float(info["metal_outer_temperature_k"]), 2)),
+                ("R total [K/W]", _fmt_number(float(info["r_total_k_w"]), 6)),
+            ])
+        self._set_selected_result_rows(rows)
         self._draw_wall_stack(edge.intermediate)
+
+    def _set_selected_result_rows(self, rows: list[tuple[str, str]]) -> None:
+        for index, (item, value) in enumerate(rows):
+            tags = ("stale",) if item == "Status" and "OLD DATA" in value else ()
+            self.selected_result_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(item, value),
+                tags=tags,
+            )
 
     def _draw_wall_stack_placeholder(self, text: str) -> None:
         canvas = self.wall_stack_canvas
@@ -2809,19 +2971,20 @@ class PassageApp(tk.Tk):
             x0 = margin + index * (block_width + gap)
             x1 = x0 + block_width
             fill = _value_to_color(temperature, values)
+            text_color = _contrast_text_color(fill)
             canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline=BORDER_COLOR)
             canvas.create_text(
                 (x0 + x1) / 2,
                 y0 + 20,
                 text=label,
-                fill=TEXT_COLOR,
+                fill=text_color,
                 font=("Segoe UI", 9, "bold"),
             )
             canvas.create_text(
                 (x0 + x1) / 2,
                 y0 + 44,
                 text=f"{temperature:,.1f} K",
-                fill=TEXT_COLOR,
+                fill=text_color,
                 font=("Segoe UI", 9),
             )
         canvas.create_text(
@@ -3144,6 +3307,26 @@ def _interpolate_color(start: str, end: str, fraction: float) -> str:
         for start_value, end_value in zip(start_rgb, end_rgb)
     )
     return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+
+def _contrast_text_color(hex_color: str) -> str:
+    color = hex_color.lstrip("#")
+    red, green, blue = (int(color[index:index + 2], 16) for index in (0, 2, 4))
+    luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+    return "#ffffff" if luminance < 150 else "#111827"
+
+
+def _math_lines(equation: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in equation.splitlines():
+        line = raw_line.strip()
+        if not line or line in {r"\begin{aligned}", r"\end{aligned}"}:
+            continue
+        line = line.replace("&", "")
+        if line.endswith(r"\\"):
+            line = line[:-2].strip()
+        lines.append(line)
+    return lines
 
 
 def _point_to_segment_distance(
