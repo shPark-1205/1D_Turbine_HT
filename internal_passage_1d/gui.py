@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import tkinter as tk
+from copy import deepcopy
+from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, NamedTuple
@@ -18,6 +21,11 @@ try:
 except ImportError:  # pragma: no cover - text fallback is used when absent.
     Figure = None
     FigureCanvasAgg = None
+
+try:
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+except ImportError:  # pragma: no cover - plot fallback is used when absent.
+    FigureCanvasTkAgg = None
 
 from .models import (
     EdgeSpec,
@@ -37,6 +45,34 @@ TECHNOLOGIES = ("smooth", "rib", "turning", "pin_fin")
 SHAPES = ("rectangular", "circular")
 WALL_MODES = ("adiabatic", "wall_temperature", "heat_flux", "external_convection")
 PROPERTY_MODELS = ("ideal_gas", "coolprop")
+SWEEP_MAX_VARIABLES = 3
+SWEEP_OBJECTIVE_SCOPES = ("Global", "Node", "Edge")
+SWEEP_DIRECTIONS = ("Minimize", "Maximize")
+GLOBAL_OBJECTIVE_METRICS = ("total_dp", "outlet_T", "max_wall_T")
+NODE_OBJECTIVE_METRICS = ("mass_flow", "temperature", "pressure")
+EDGE_BASE_OBJECTIVE_METRICS = (
+    "mass_flow",
+    "inlet_temperature",
+    "outlet_temperature",
+    "inlet_pressure",
+    "outlet_pressure",
+    "reynolds",
+    "nusselt",
+    "htc",
+    "friction_factor_darcy",
+    "velocity",
+    "heat_transfer_area",
+    "heat_rate",
+    "dp_friction",
+    "dp_rotation",
+    "dp_minor",
+    "dp_total",
+)
+CONSTRAINT_SPECS = {
+    "outlet_pressure": ("Outlet pressure", "pressure"),
+    "max_wall_T": ("Max wall temperature", "temperature"),
+    "total_dp": ("Total dp", "pressure"),
+}
 OVERLAY_METRICS = (
     "Technology",
     "Edge Tout [K]",
@@ -109,6 +145,21 @@ class ParamSpec(NamedTuple):
     key: str
     label: str
     default: str = ""
+
+
+@dataclass
+class SweepVariable:
+    target_id: str
+    scope: str
+    object_id: str
+    field_key: str
+    row_key: str
+    label: str
+    unit_group: str | None
+    unit: str
+    start: str = ""
+    end: str = ""
+    step: str = ""
 
 
 TECH_PARAM_SPECS: dict[str, tuple[ParamSpec, ...]] = {
@@ -191,15 +242,47 @@ class PassageApp(tk.Tk):
         self._drag_started = False
         self._workspace_scroll_canvas: tk.Canvas | None = None
         self._correlations_scroll_canvas: tk.Canvas | None = None
+        self._sweep_scroll_canvas: tk.Canvas | None = None
         self._formula_images: list[Any] = []
         self.results_stale = False
         self._focused_form: str | None = None
         self._is_committing_form = False
         self._suppress_stale_mark = False
+        self.sweep_variables: dict[str, SweepVariable] = {}
+        self.sweep_results: list[dict[str, Any]] = []
+        self._sweep_checkbox_vars: dict[str, tk.BooleanVar] = {}
+        self._selected_sweep_variable_id: str | None = None
+        self._sweep_cancel_requested = False
+        self._sweep_plot_canvas: Any = None
 
         self.property_model = tk.StringVar(value="ideal_gas")
         self.overlay_metric = tk.StringVar(value="Technology")
         self.auto_calculate = tk.BooleanVar(value=False)
+        self.sweep_objective_scope = tk.StringVar(value="Global")
+        self.sweep_objective_node = tk.StringVar()
+        self.sweep_objective_edge = tk.StringVar()
+        self.sweep_objective_metric = tk.StringVar(value="total_dp")
+        self.sweep_direction = tk.StringVar(value="Minimize")
+        self.sweep_range_start = tk.StringVar()
+        self.sweep_range_end = tk.StringVar()
+        self.sweep_range_step = tk.StringVar()
+        self.sweep_range_unit = tk.StringVar()
+        self.sweep_plot_type = tk.StringVar(value="Auto")
+        self.sweep_plot_x = tk.StringVar()
+        self.sweep_plot_y = tk.StringVar()
+        self._constraint_enabled = {
+            key: tk.BooleanVar(value=False) for key in CONSTRAINT_SPECS
+        }
+        self._constraint_min = {
+            key: tk.StringVar() for key in CONSTRAINT_SPECS
+        }
+        self._constraint_max = {
+            key: tk.StringVar() for key in CONSTRAINT_SPECS
+        }
+        self._constraint_units = {
+            key: tk.StringVar(value=UNIT_OPTIONS[group][0])
+            for key, (_label, group) in CONSTRAINT_SPECS.items()
+        }
         self._unit_vars = {
             key: tk.StringVar(value=_default_unit_for_key(key))
             for key in FIELD_UNIT_GROUPS
@@ -397,13 +480,15 @@ class PassageApp(tk.Tk):
         ttk.Label(toolbar, text="Property model", style="Header.TLabel").pack(
             side=tk.LEFT, padx=(16, 4)
         )
-        ttk.Combobox(
+        property_combo = ttk.Combobox(
             toolbar,
             textvariable=self.property_model,
             values=PROPERTY_MODELS,
             state="readonly",
             width=12,
-        ).pack(side=tk.LEFT)
+        )
+        property_combo.pack(side=tk.LEFT)
+        self._bind_combobox_mousewheel(property_combo)
         ttk.Button(toolbar, text="Export CSV", command=self.export_results).pack(
             side=tk.LEFT, padx=(8, 0)
         )
@@ -412,15 +497,18 @@ class PassageApp(tk.Tk):
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
         self.workspace_tab = ttk.Frame(self.notebook)
+        self.sweep_tab = ttk.Frame(self.notebook)
         self.correlations_tab = ttk.Frame(self.notebook)
         self.results_tab = ttk.Frame(self.notebook)
         self.warnings_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.workspace_tab, text="Workspace")
+        self.notebook.add(self.sweep_tab, text="Parametric Sweep")
         self.notebook.add(self.correlations_tab, text="Correlations")
         self.notebook.add(self.results_tab, text="Results")
         self.notebook.add(self.warnings_tab, text="Warnings")
 
         self._build_workspace_tab()
+        self._build_sweep_tab()
         self._build_correlations_tab()
         self._build_results_tab()
         self._build_warnings_tab()
@@ -474,13 +562,15 @@ class PassageApp(tk.Tk):
             side=tk.LEFT,
             padx=(12, 4),
         )
-        ttk.Combobox(
+        overlay_combo = ttk.Combobox(
             canvas_toolbar,
             textvariable=self.overlay_metric,
             values=OVERLAY_METRICS,
             state="readonly",
             width=18,
-        ).pack(side=tk.LEFT)
+        )
+        overlay_combo.pack(side=tk.LEFT)
+        self._bind_combobox_mousewheel(overlay_combo)
         self.layout_status_label = ttk.Label(
             canvas_toolbar,
             text="Mode: Select / Move",
@@ -539,6 +629,368 @@ class PassageApp(tk.Tk):
         self._build_workspace_edge_editor(right)
         self._build_selected_result_panel(right)
         self._build_workspace_tables(right)
+
+    def _build_sweep_tab(self) -> None:
+        sweep_canvas = tk.Canvas(
+            self.sweep_tab,
+            highlightthickness=0,
+            bg=WINDOW_BG,
+        )
+        sweep_scroll = ttk.Scrollbar(
+            self.sweep_tab,
+            orient=tk.VERTICAL,
+            command=sweep_canvas.yview,
+        )
+        sweep_canvas.configure(yscrollcommand=sweep_scroll.set)
+        sweep_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        sweep_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content = ttk.Frame(sweep_canvas, padding=4)
+        content_window = sweep_canvas.create_window((0, 0), window=content, anchor=tk.NW)
+
+        def resize_scroll_region(_event: tk.Event) -> None:
+            sweep_canvas.configure(scrollregion=sweep_canvas.bbox(tk.ALL))
+
+        def resize_content_width(event: tk.Event) -> None:
+            sweep_canvas.itemconfigure(content_window, width=event.width)
+
+        content.bind("<Configure>", resize_scroll_region)
+        sweep_canvas.bind("<Configure>", resize_content_width)
+        self._sweep_scroll_canvas = sweep_canvas
+        self.bind_all("<MouseWheel>", self._on_sweep_mousewheel, add="+")
+
+        top = ttk.PanedWindow(content, orient=tk.HORIZONTAL)
+        top.pack(fill=tk.BOTH, expand=True)
+        controls = ttk.Frame(top)
+        results = ttk.Frame(top)
+        top.add(controls, weight=2)
+        top.add(results, weight=3)
+
+        objective_panel = self._panel(controls)
+        objective_panel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(objective_panel, text="Objective", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 8)
+        )
+        self._sweep_combo(
+            objective_panel,
+            1,
+            "Scope",
+            self.sweep_objective_scope,
+            SWEEP_OBJECTIVE_SCOPES,
+        )
+        self._sweep_combo(
+            objective_panel,
+            2,
+            "Node",
+            self.sweep_objective_node,
+            (),
+        )
+        self.sweep_objective_node_combo = objective_panel.grid_slaves(row=2, column=1)[0]
+        self._sweep_combo(
+            objective_panel,
+            3,
+            "Edge",
+            self.sweep_objective_edge,
+            (),
+        )
+        self.sweep_objective_edge_combo = objective_panel.grid_slaves(row=3, column=1)[0]
+        self._sweep_combo(
+            objective_panel,
+            4,
+            "Metric",
+            self.sweep_objective_metric,
+            GLOBAL_OBJECTIVE_METRICS,
+        )
+        self.sweep_objective_metric_combo = objective_panel.grid_slaves(row=4, column=1)[0]
+        self._sweep_combo(
+            objective_panel,
+            5,
+            "Direction",
+            self.sweep_direction,
+            SWEEP_DIRECTIONS,
+        )
+        objective_panel.columnconfigure(1, weight=1)
+        self.sweep_objective_scope.trace_add(
+            "write",
+            lambda *_args: self._update_sweep_objective_controls(),
+        )
+        self.sweep_objective_edge.trace_add(
+            "write",
+            lambda *_args: self._update_sweep_objective_controls(preserve_metric=True),
+        )
+
+        constraint_panel = self._panel(controls)
+        constraint_panel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            constraint_panel,
+            text="Constraints",
+            style="Section.TLabel",
+        ).grid(row=0, column=0, columnspan=5, sticky=tk.W, pady=(0, 8))
+        ttk.Label(constraint_panel, text="Use", style="Header.TLabel").grid(
+            row=1, column=0, sticky=tk.W
+        )
+        ttk.Label(constraint_panel, text="Metric", style="Header.TLabel").grid(
+            row=1, column=1, sticky=tk.W
+        )
+        ttk.Label(constraint_panel, text="Min", style="Header.TLabel").grid(
+            row=1, column=2, sticky=tk.W
+        )
+        ttk.Label(constraint_panel, text="Max", style="Header.TLabel").grid(
+            row=1, column=3, sticky=tk.W
+        )
+        ttk.Label(constraint_panel, text="Unit", style="Header.TLabel").grid(
+            row=1, column=4, sticky=tk.W
+        )
+        for row_index, (key, (label, unit_group)) in enumerate(CONSTRAINT_SPECS.items(), start=2):
+            ttk.Checkbutton(
+                constraint_panel,
+                variable=self._constraint_enabled[key],
+            ).grid(row=row_index, column=0, sticky=tk.W, pady=2)
+            ttk.Label(constraint_panel, text=label).grid(
+                row=row_index, column=1, sticky=tk.W, pady=2, padx=(4, 10)
+            )
+            ttk.Entry(
+                constraint_panel,
+                textvariable=self._constraint_min[key],
+                width=12,
+            ).grid(row=row_index, column=2, sticky=tk.EW, pady=2, padx=(0, 6))
+            ttk.Entry(
+                constraint_panel,
+                textvariable=self._constraint_max[key],
+                width=12,
+            ).grid(row=row_index, column=3, sticky=tk.EW, pady=2, padx=(0, 6))
+            unit_combo = ttk.Combobox(
+                constraint_panel,
+                textvariable=self._constraint_units[key],
+                values=UNIT_OPTIONS[unit_group],
+                state="readonly",
+                width=12,
+            )
+            unit_combo.grid(row=row_index, column=4, sticky=tk.EW, pady=2)
+            self._bind_combobox_mousewheel(unit_combo)
+        constraint_panel.columnconfigure(2, weight=1)
+        constraint_panel.columnconfigure(3, weight=1)
+
+        variable_panel = self._panel(controls)
+        variable_panel.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        ttk.Label(
+            variable_panel,
+            text="Sweep Variables",
+            style="Section.TLabel",
+        ).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(
+            variable_panel,
+            text="Check numeric inputs in Workspace. Up to 3 variables can be swept.",
+            style="Header.TLabel",
+        ).pack(anchor=tk.W, pady=(0, 6))
+        variable_columns = ("label", "current", "start", "end", "step", "unit")
+        self.sweep_variable_tree = ttk.Treeview(
+            variable_panel,
+            columns=variable_columns,
+            show="headings",
+            height=7,
+        )
+        variable_headings = {
+            "label": "Variable",
+            "current": "Current",
+            "start": "Start",
+            "end": "End",
+            "step": "Step",
+            "unit": "Unit",
+        }
+        variable_widths = {
+            "label": 230,
+            "current": 80,
+            "start": 80,
+            "end": 80,
+            "step": 80,
+            "unit": 70,
+        }
+        for column in variable_columns:
+            self.sweep_variable_tree.heading(column, text=variable_headings[column])
+            self.sweep_variable_tree.column(column, width=variable_widths[column], anchor=tk.W)
+        self.sweep_variable_tree.pack(fill=tk.X)
+        self.sweep_variable_tree.bind(
+            "<<TreeviewSelect>>",
+            self._on_sweep_variable_select,
+        )
+
+        range_frame = ttk.Frame(variable_panel, style="Panel.TFrame")
+        range_frame.pack(fill=tk.X, pady=(8, 0))
+        self.sweep_selected_variable_label = ttk.Label(
+            range_frame,
+            text="Select a sweep variable to edit its range.",
+            style="Header.TLabel",
+        )
+        self.sweep_selected_variable_label.grid(
+            row=0,
+            column=0,
+            columnspan=6,
+            sticky=tk.W,
+            pady=(0, 4),
+        )
+        for column, label in enumerate(("Start", "End", "Step", "Unit")):
+            ttk.Label(range_frame, text=label, style="Header.TLabel").grid(
+                row=1,
+                column=column,
+                sticky=tk.W,
+            )
+        ttk.Entry(range_frame, textvariable=self.sweep_range_start, width=12).grid(
+            row=2,
+            column=0,
+            sticky=tk.EW,
+            padx=(0, 6),
+        )
+        ttk.Entry(range_frame, textvariable=self.sweep_range_end, width=12).grid(
+            row=2,
+            column=1,
+            sticky=tk.EW,
+            padx=(0, 6),
+        )
+        ttk.Entry(range_frame, textvariable=self.sweep_range_step, width=12).grid(
+            row=2,
+            column=2,
+            sticky=tk.EW,
+            padx=(0, 6),
+        )
+        self.sweep_range_unit_combo = ttk.Combobox(
+            range_frame,
+            textvariable=self.sweep_range_unit,
+            values=(),
+            state="readonly",
+            width=12,
+        )
+        self.sweep_range_unit_combo.grid(row=2, column=3, sticky=tk.EW, padx=(0, 6))
+        self._bind_combobox_mousewheel(self.sweep_range_unit_combo)
+        ttk.Button(
+            range_frame,
+            text="Apply Range",
+            command=self._apply_sweep_range,
+        ).grid(row=2, column=4, sticky=tk.EW, padx=(0, 6))
+        ttk.Button(
+            range_frame,
+            text="Remove",
+            command=self._remove_selected_sweep_variable,
+        ).grid(row=2, column=5, sticky=tk.EW)
+        for column in range(4):
+            range_frame.columnconfigure(column, weight=1)
+        self.sweep_case_count_label = ttk.Label(
+            variable_panel,
+            text="Total cases: 0",
+            style="Header.TLabel",
+        )
+        self.sweep_case_count_label.pack(anchor=tk.W, pady=(8, 0))
+
+        run_panel = self._panel(controls)
+        run_panel.pack(fill=tk.X)
+        ttk.Button(
+            run_panel,
+            text="Run Sweep",
+            command=self.run_sweep,
+            style="Accent.TButton",
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            run_panel,
+            text="Stop",
+            command=self.stop_sweep,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            run_panel,
+            text="Clear Variables",
+            command=self._clear_sweep_variables,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self.sweep_progress = ttk.Progressbar(run_panel, mode="determinate")
+        self.sweep_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 8))
+        self.sweep_status_label = ttk.Label(
+            run_panel,
+            text="Ready",
+            style="Header.TLabel",
+        )
+        self.sweep_status_label.pack(side=tk.RIGHT)
+
+        best_panel = self._panel(results)
+        best_panel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(best_panel, text="Best Case", style="Section.TLabel").pack(
+            anchor=tk.W,
+            pady=(0, 8),
+        )
+        self.sweep_best_tree = ttk.Treeview(
+            best_panel,
+            columns=("item", "value"),
+            show="headings",
+            height=7,
+        )
+        self.sweep_best_tree.heading("item", text="Item")
+        self.sweep_best_tree.heading("value", text="Value")
+        self.sweep_best_tree.column("item", width=180, anchor=tk.W)
+        self.sweep_best_tree.column("value", width=260, anchor=tk.W)
+        self.sweep_best_tree.pack(fill=tk.X)
+
+        table_panel = self._panel(results)
+        table_panel.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        ttk.Label(table_panel, text="Sweep Results", style="Section.TLabel").pack(
+            anchor=tk.W,
+            pady=(0, 8),
+        )
+        result_frame = ttk.Frame(table_panel, style="Panel.TFrame")
+        result_frame.pack(fill=tk.BOTH, expand=True)
+        self.sweep_result_tree = ttk.Treeview(result_frame, show="headings", height=10)
+        self.sweep_result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        result_scroll = ttk.Scrollbar(
+            result_frame,
+            orient=tk.VERTICAL,
+            command=self.sweep_result_tree.yview,
+        )
+        self.sweep_result_tree.configure(yscrollcommand=result_scroll.set)
+        result_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        plot_panel = self._panel(results)
+        plot_panel.pack(fill=tk.BOTH, expand=True)
+        plot_toolbar = ttk.Frame(plot_panel, style="Panel.TFrame")
+        plot_toolbar.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(plot_toolbar, text="Plot", style="Section.TLabel").pack(
+            side=tk.LEFT,
+            padx=(0, 12),
+        )
+        ttk.Label(plot_toolbar, text="Type", style="Header.TLabel").pack(side=tk.LEFT)
+        plot_type_combo = ttk.Combobox(
+            plot_toolbar,
+            textvariable=self.sweep_plot_type,
+            values=("Auto", "Line", "Heatmap", "Surface", "Scatter"),
+            state="readonly",
+            width=10,
+        )
+        plot_type_combo.pack(side=tk.LEFT, padx=(4, 10))
+        self._bind_combobox_mousewheel(plot_type_combo)
+        ttk.Label(plot_toolbar, text="X", style="Header.TLabel").pack(side=tk.LEFT)
+        self.sweep_plot_x_combo = ttk.Combobox(
+            plot_toolbar,
+            textvariable=self.sweep_plot_x,
+            values=(),
+            state="readonly",
+            width=22,
+        )
+        self.sweep_plot_x_combo.pack(side=tk.LEFT, padx=(4, 10))
+        self._bind_combobox_mousewheel(self.sweep_plot_x_combo)
+        ttk.Label(plot_toolbar, text="Y", style="Header.TLabel").pack(side=tk.LEFT)
+        self.sweep_plot_y_combo = ttk.Combobox(
+            plot_toolbar,
+            textvariable=self.sweep_plot_y,
+            values=(),
+            state="readonly",
+            width=22,
+        )
+        self.sweep_plot_y_combo.pack(side=tk.LEFT, padx=(4, 10))
+        self._bind_combobox_mousewheel(self.sweep_plot_y_combo)
+        ttk.Button(
+            plot_toolbar,
+            text="Update Plot",
+            command=self._update_sweep_plot,
+        ).pack(side=tk.LEFT)
+        self.sweep_plot_frame = ttk.Frame(plot_panel, style="Panel.TFrame")
+        self.sweep_plot_frame.pack(fill=tk.BOTH, expand=True)
+        self._set_sweep_best_rows([("Status", "Run a sweep to view the best case.")])
+        self._set_sweep_result_columns([])
+        self._update_sweep_objective_controls()
 
     def _build_workspace_summary(self, parent: ttk.Frame) -> None:
         summary_panel = self._panel(parent)
@@ -616,13 +1068,15 @@ class PassageApp(tk.Tk):
         ttk.Label(node_panel, text="Kind", style="Header.TLabel").grid(
             row=2, column=0, sticky=tk.W, pady=3
         )
-        ttk.Combobox(
+        node_kind_combo = ttk.Combobox(
             node_panel,
             textvariable=self._node_vars["kind"],
             values=NODE_KINDS,
             state="readonly",
             width=20,
-        ).grid(row=2, column=1, sticky=tk.EW, pady=3)
+        )
+        node_kind_combo.grid(row=2, column=1, sticky=tk.EW, pady=3)
+        self._bind_combobox_mousewheel(node_kind_combo)
         self.node_inlet_fields = []
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
@@ -631,6 +1085,7 @@ class PassageApp(tk.Tk):
             self._node_vars["inlet_mdot"],
             form="node",
             unit_key="inlet_mdot",
+            sweep_key="inlet_mdot",
         ))
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
@@ -639,6 +1094,7 @@ class PassageApp(tk.Tk):
             self._node_vars["inlet_temperature"],
             form="node",
             unit_key="inlet_temperature",
+            sweep_key="inlet_temperature",
         ))
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
@@ -647,6 +1103,7 @@ class PassageApp(tk.Tk):
             self._node_vars["inlet_pressure"],
             form="node",
             unit_key="inlet_pressure",
+            sweep_key="inlet_pressure",
         ))
         node_panel.columnconfigure(1, weight=1)
 
@@ -718,6 +1175,7 @@ class PassageApp(tk.Tk):
                 self._edge_vars[key],
                 form="edge",
                 unit_key=key,
+                sweep_key=key,
             )
             row += 1
         self._labeled_combo(edge_panel, row, "Wall mode", self._edge_vars["wall_mode"], WALL_MODES)
@@ -740,6 +1198,7 @@ class PassageApp(tk.Tk):
                 self._edge_vars[key],
                 form="edge",
                 unit_key=key,
+                sweep_key=key,
             )
             row += 1
 
@@ -1045,6 +1504,24 @@ class PassageApp(tk.Tk):
         if canvas is None:
             return
         if str(self.notebook.select()) != str(self.correlations_tab):
+            return
+        pointer_x = canvas.winfo_pointerx()
+        pointer_y = canvas.winfo_pointery()
+        left = canvas.winfo_rootx()
+        top = canvas.winfo_rooty()
+        right = left + canvas.winfo_width()
+        bottom = top + canvas.winfo_height()
+        if not (left <= pointer_x <= right and top <= pointer_y <= bottom):
+            return
+        delta = getattr(event, "delta", 0)
+        if delta:
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+    def _on_sweep_mousewheel(self, event: tk.Event) -> None:
+        canvas = self._sweep_scroll_canvas
+        if canvas is None:
+            return
+        if str(self.notebook.select()) != str(self.sweep_tab):
             return
         pointer_x = canvas.winfo_pointerx()
         pointer_y = canvas.winfo_pointery()
@@ -2245,15 +2722,25 @@ class PassageApp(tk.Tk):
         variable: tk.StringVar,
         form: str | None = None,
         unit_key: str | None = None,
+        sweep_key: str | None = None,
     ) -> tuple[ttk.Label, tk.Widget]:
         label_widget = ttk.Label(parent, text=label)
         label_widget.grid(row=row, column=0, sticky=tk.W, pady=3)
         unit_group = _unit_group_for_key(unit_key)
         if unit_group is None:
-            entry = ttk.Entry(parent, textvariable=variable)
-            entry.grid(row=row, column=1, sticky=tk.EW, pady=3)
+            if sweep_key is None:
+                entry = ttk.Entry(parent, textvariable=variable)
+                entry.grid(row=row, column=1, sticky=tk.EW, pady=3)
+                self._bind_entry_commit(entry, form)
+                return label_widget, entry
+            value_frame = ttk.Frame(parent)
+            value_frame.grid(row=row, column=1, sticky=tk.EW, pady=3)
+            value_frame.columnconfigure(0, weight=1)
+            entry = ttk.Entry(value_frame, textvariable=variable)
+            entry.grid(row=0, column=0, sticky=tk.EW)
             self._bind_entry_commit(entry, form)
-            return label_widget, entry
+            self._create_sweep_checkbutton(value_frame, 1, form, sweep_key)
+            return label_widget, value_frame
 
         value_frame = ttk.Frame(parent)
         value_frame.grid(row=row, column=1, sticky=tk.EW, pady=3)
@@ -2269,10 +2756,13 @@ class PassageApp(tk.Tk):
             width=13,
         )
         unit_combo.grid(row=0, column=1, sticky=tk.E, padx=(6, 0))
+        self._bind_combobox_mousewheel(unit_combo)
         unit_combo.bind(
             "<<ComboboxSelected>>",
             lambda _event, key=unit_key, form=form: self._on_unit_change(key, form),
         )
+        if sweep_key is not None:
+            self._create_sweep_checkbutton(value_frame, 2, form, sweep_key)
         return label_widget, value_frame
 
     def _labeled_combo(
@@ -2294,6 +2784,7 @@ class PassageApp(tk.Tk):
             width=20,
         )
         combo.grid(row=row, column=1, sticky=tk.EW, pady=3)
+        self._bind_combobox_mousewheel(combo)
         if form is not None:
             combo.bind(
                 "<FocusIn>",
@@ -2316,6 +2807,27 @@ class PassageApp(tk.Tk):
             )
         return label_widget, combo
 
+    def _sweep_combo(
+        self,
+        parent: tk.Widget,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        values: tuple[str, ...],
+    ) -> tuple[ttk.Label, ttk.Combobox]:
+        label_widget = ttk.Label(parent, text=label, style="Header.TLabel")
+        label_widget.grid(row=row, column=0, sticky=tk.W, pady=3, padx=(0, 8))
+        combo = ttk.Combobox(
+            parent,
+            textvariable=variable,
+            values=values,
+            state="readonly",
+            width=20,
+        )
+        combo.grid(row=row, column=1, sticky=tk.EW, pady=3)
+        self._bind_combobox_mousewheel(combo)
+        return label_widget, combo
+
     def _bind_entry_commit(self, entry: ttk.Entry, form: str | None) -> None:
         if form is None:
             return
@@ -2334,6 +2846,33 @@ class PassageApp(tk.Tk):
             lambda _event, form=form: self._commit_form_edit(form),
             add="+",
         )
+
+    def _bind_combobox_mousewheel(self, combo: ttk.Combobox) -> None:
+        combo.bind("<MouseWheel>", self._on_combobox_mousewheel, add="+")
+
+    def _on_combobox_mousewheel(self, event: tk.Event) -> str:
+        self._on_workspace_mousewheel(event)
+        self._on_correlations_mousewheel(event)
+        self._on_sweep_mousewheel(event)
+        return "break"
+
+    def _create_sweep_checkbutton(
+        self,
+        parent: ttk.Frame,
+        column: int,
+        form: str | None,
+        field_key: str,
+    ) -> None:
+        if form not in {"node", "edge"}:
+            return
+        var_key = f"{form}:{field_key}"
+        variable = self._sweep_checkbox_vars.setdefault(var_key, tk.BooleanVar())
+        ttk.Checkbutton(
+            parent,
+            text="Sweep",
+            variable=variable,
+            command=lambda form=form, key=field_key: self._toggle_sweep_variable(form, key),
+        ).grid(row=0, column=column, sticky=tk.E, padx=(8, 0))
 
     def _on_technology_change(self, *_args: object) -> None:
         if self._syncing_edge_form:
@@ -2467,6 +3006,122 @@ class PassageApp(tk.Tk):
                 unit = _default_unit_for_key(key)
             self._unit_vars[key].set(unit)
             self._last_unit_values[key] = unit
+
+    def _toggle_sweep_variable(self, form: str, field_key: str) -> None:
+        target = self._current_sweep_target(form, field_key)
+        checkbox = self._sweep_checkbox_vars.get(f"{form}:{field_key}")
+        checked = bool(checkbox.get()) if checkbox is not None else False
+        if target is None:
+            if checkbox is not None:
+                checkbox.set(False)
+            return
+
+        if checked:
+            if (
+                target.target_id not in self.sweep_variables
+                and len(self.sweep_variables) >= SWEEP_MAX_VARIABLES
+            ):
+                if checkbox is not None:
+                    checkbox.set(False)
+                messagebox.showerror(
+                    "Too many sweep variables",
+                    f"Select up to {SWEEP_MAX_VARIABLES} sweep variables in this version.",
+                )
+                return
+            existing = self.sweep_variables.get(target.target_id)
+            if existing is not None:
+                target.start = existing.start
+                target.end = existing.end
+                target.step = existing.step
+                target.unit = existing.unit
+            else:
+                current_value = self._current_sweep_display_value(target)
+                target.start = current_value
+                target.end = current_value
+            self.sweep_variables[target.target_id] = target
+        else:
+            self.sweep_variables.pop(target.target_id, None)
+            if self._selected_sweep_variable_id == target.target_id:
+                self._selected_sweep_variable_id = None
+        self._sync_sweep_checkboxes()
+        self._refresh_sweep_variable_tree()
+
+    def _current_sweep_target(
+        self,
+        form: str,
+        field_key: str,
+    ) -> SweepVariable | None:
+        if form == "node":
+            index = self._selected_index(self.node_tree) if hasattr(self, "node_tree") else None
+            if index is None or index >= len(self.node_rows):
+                return None
+            row = self.node_rows[index]
+            if row.get("kind") != "inlet":
+                return None
+            if field_key not in NODE_UNIT_KEYS:
+                return None
+            object_id = row["node_id"]
+            row_key = field_key
+            label = f"Node {object_id} / {_field_label(field_key)}"
+            scope = "node"
+        elif form == "edge":
+            index = self._selected_index(self.edge_tree) if hasattr(self, "edge_tree") else None
+            if index is None or index >= len(self.edge_rows):
+                return None
+            row = self.edge_rows[index]
+            object_id = row["edge_id"]
+            if field_key in EDGE_FIELD_UNIT_KEYS:
+                row_key = field_key
+                scope = "edge"
+                label = f"Edge {object_id} / {_field_label(field_key)}"
+            elif field_key in ALL_PARAM_KEYS:
+                row_key = _param_row_key(field_key)
+                scope = "param"
+                label = f"Edge {object_id} / {_field_label(field_key)}"
+            else:
+                return None
+        else:
+            return None
+
+        unit_group = _unit_group_for_key(field_key)
+        unit = (
+            row.get(_unit_row_key(field_key), _default_unit_for_key(field_key))
+            if unit_group is not None
+            else ""
+        )
+        return SweepVariable(
+            target_id=f"{scope}:{object_id}:{field_key}",
+            scope=scope,
+            object_id=object_id,
+            field_key=field_key,
+            row_key=row_key,
+            label=label,
+            unit_group=unit_group,
+            unit=unit,
+        )
+
+    def _current_sweep_display_value(self, target: SweepVariable) -> str:
+        row = self._find_sweep_row(target)
+        if row is None:
+            return ""
+        return row.get(target.row_key, "")
+
+    def _find_sweep_row(self, target: SweepVariable) -> dict[str, str] | None:
+        if target.scope == "node":
+            return next(
+                (row for row in self.node_rows if row["node_id"] == target.object_id),
+                None,
+            )
+        return next(
+            (row for row in self.edge_rows if row["edge_id"] == target.object_id),
+            None,
+        )
+
+    def _sync_sweep_checkboxes(self) -> None:
+        for var_key, variable in self._sweep_checkbox_vars.items():
+            form, field_key = var_key.split(":", 1)
+            target = self._current_sweep_target(form, field_key)
+            variable.set(target is not None and target.target_id in self.sweep_variables)
 
     def _update_node_field_visibility(self) -> None:
         if not hasattr(self, "node_inlet_fields"):
@@ -2625,13 +3280,17 @@ class PassageApp(tk.Tk):
             )
             unit_group = _unit_group_for_key(spec.key)
             if unit_group is None:
+                value_frame = ttk.Frame(self.tech_param_frame)
+                value_frame.grid(row=row, column=1, sticky=tk.EW, pady=2, padx=(8, 0))
+                value_frame.columnconfigure(0, weight=1)
                 entry = ttk.Entry(
-                    self.tech_param_frame,
+                    value_frame,
                     textvariable=self._tech_param_vars[spec.key],
                     width=20,
                 )
-                entry.grid(row=row, column=1, sticky=tk.EW, pady=2, padx=(8, 0))
+                entry.grid(row=0, column=0, sticky=tk.EW)
                 self._bind_entry_commit(entry, "edge")
+                self._create_sweep_checkbutton(value_frame, 1, "edge", spec.key)
                 continue
 
             value_frame = ttk.Frame(self.tech_param_frame)
@@ -2656,7 +3315,9 @@ class PassageApp(tk.Tk):
                 "<<ComboboxSelected>>",
                 lambda _event, key=spec.key: self._on_unit_change(key, "edge"),
             )
+            self._create_sweep_checkbutton(value_frame, 2, "edge", spec.key)
         self.tech_param_frame.columnconfigure(1, weight=1)
+        self._sync_sweep_checkboxes()
 
     def load_example(self) -> None:
         self._load_network(build_default_network())
@@ -2671,6 +3332,8 @@ class PassageApp(tk.Tk):
         self._refresh_node_combos()
         self._update_dashboard_summary()
         self._select_first_rows()
+        self._sync_sweep_checkboxes()
+        self._refresh_sweep_variable_tree()
 
     def _select_first_rows(self) -> None:
         if self.node_rows:
@@ -2729,6 +3392,8 @@ class PassageApp(tk.Tk):
             )
         self._refresh_dashboard_map()
         self._redraw_layout_canvas()
+        if hasattr(self, "sweep_objective_edge_combo"):
+            self._update_sweep_objective_controls(preserve_metric=True)
 
     def _refresh_dashboard_map(self) -> None:
         if not hasattr(self, "dashboard_map_tree"):
@@ -2749,6 +3414,657 @@ class PassageApp(tk.Tk):
         values = tuple(row["node_id"] for row in self.node_rows)
         self.edge_from_combo.configure(values=values)
         self.edge_to_combo.configure(values=values)
+        if hasattr(self, "sweep_objective_node_combo"):
+            self._update_sweep_objective_controls()
+
+    def _update_sweep_objective_controls(
+        self,
+        preserve_metric: bool = False,
+    ) -> None:
+        if not hasattr(self, "sweep_objective_metric_combo"):
+            return
+        node_values = tuple(row["node_id"] for row in self.node_rows)
+        edge_values = tuple(row["edge_id"] for row in self.edge_rows)
+        self.sweep_objective_node_combo.configure(values=node_values)
+        self.sweep_objective_edge_combo.configure(values=edge_values)
+        if node_values and self.sweep_objective_node.get() not in node_values:
+            self.sweep_objective_node.set(node_values[0])
+        if edge_values and self.sweep_objective_edge.get() not in edge_values:
+            self.sweep_objective_edge.set(edge_values[0])
+
+        scope = self.sweep_objective_scope.get()
+        if scope == "Node":
+            metrics = NODE_OBJECTIVE_METRICS
+            node_state = "readonly"
+            edge_state = tk.DISABLED
+        elif scope == "Edge":
+            metrics = self._edge_metric_options(self.sweep_objective_edge.get())
+            node_state = tk.DISABLED
+            edge_state = "readonly"
+        else:
+            metrics = GLOBAL_OBJECTIVE_METRICS
+            node_state = tk.DISABLED
+            edge_state = tk.DISABLED
+        self.sweep_objective_node_combo.configure(state=node_state)
+        self.sweep_objective_edge_combo.configure(state=edge_state)
+        self.sweep_objective_metric_combo.configure(values=metrics)
+        if not preserve_metric or self.sweep_objective_metric.get() not in metrics:
+            self.sweep_objective_metric.set(metrics[0] if metrics else "")
+
+    def _edge_metric_options(self, edge_id: str) -> tuple[str, ...]:
+        metrics = list(EDGE_BASE_OBJECTIVE_METRICS)
+        if self.last_result is not None and edge_id in self.last_result.edges:
+            edge = self.last_result.edges[edge_id]
+            for key, value in edge.intermediate.items():
+                if isinstance(value, (int, float)) and key not in metrics:
+                    metrics.append(key)
+        return tuple(metrics)
+
+    def _refresh_sweep_variable_tree(self) -> None:
+        if not hasattr(self, "sweep_variable_tree"):
+            return
+        self.sweep_variable_tree.delete(*self.sweep_variable_tree.get_children())
+        for target_id, variable in self.sweep_variables.items():
+            self.sweep_variable_tree.insert(
+                "",
+                tk.END,
+                iid=target_id,
+                values=(
+                    variable.label,
+                    self._current_sweep_display_value(variable),
+                    variable.start,
+                    variable.end,
+                    variable.step,
+                    variable.unit,
+                ),
+            )
+        if (
+            self._selected_sweep_variable_id
+            and self._selected_sweep_variable_id in self.sweep_variables
+        ):
+            self.sweep_variable_tree.selection_set(self._selected_sweep_variable_id)
+        self._update_sweep_case_count()
+        self._update_sweep_plot_variable_combos()
+
+    def _on_sweep_variable_select(self, _event: tk.Event) -> None:
+        selection = self.sweep_variable_tree.selection()
+        if not selection:
+            return
+        target_id = selection[0]
+        variable = self.sweep_variables.get(target_id)
+        if variable is None:
+            return
+        self._selected_sweep_variable_id = target_id
+        self.sweep_selected_variable_label.configure(text=variable.label)
+        self.sweep_range_start.set(variable.start)
+        self.sweep_range_end.set(variable.end)
+        self.sweep_range_step.set(variable.step)
+        if variable.unit_group is None:
+            self.sweep_range_unit_combo.configure(values=(), state=tk.DISABLED)
+            self.sweep_range_unit.set("")
+        else:
+            self.sweep_range_unit_combo.configure(
+                values=UNIT_OPTIONS[variable.unit_group],
+                state="readonly",
+            )
+            if variable.unit not in UNIT_OPTIONS[variable.unit_group]:
+                variable.unit = UNIT_OPTIONS[variable.unit_group][0]
+            self.sweep_range_unit.set(variable.unit)
+
+    def _apply_sweep_range(self) -> None:
+        target_id = self._selected_sweep_variable_id
+        if target_id is None or target_id not in self.sweep_variables:
+            messagebox.showwarning("No sweep variable", "Select a sweep variable first.")
+            return
+        variable = self.sweep_variables[target_id]
+        variable.start = self.sweep_range_start.get().strip()
+        variable.end = self.sweep_range_end.get().strip()
+        variable.step = self.sweep_range_step.get().strip()
+        if variable.unit_group is not None:
+            unit = self.sweep_range_unit.get().strip()
+            if unit not in UNIT_OPTIONS[variable.unit_group]:
+                messagebox.showerror("Invalid unit", "Select a valid unit for the sweep range.")
+                return
+            variable.unit = unit
+        self._refresh_sweep_variable_tree()
+
+    def _remove_selected_sweep_variable(self) -> None:
+        target_id = self._selected_sweep_variable_id
+        if target_id is None:
+            return
+        self.sweep_variables.pop(target_id, None)
+        self._selected_sweep_variable_id = None
+        self.sweep_selected_variable_label.configure(
+            text="Select a sweep variable to edit its range."
+        )
+        self.sweep_range_start.set("")
+        self.sweep_range_end.set("")
+        self.sweep_range_step.set("")
+        self.sweep_range_unit.set("")
+        self._sync_sweep_checkboxes()
+        self._refresh_sweep_variable_tree()
+
+    def _clear_sweep_variables(self) -> None:
+        self.sweep_variables.clear()
+        self._selected_sweep_variable_id = None
+        self._sync_sweep_checkboxes()
+        self._refresh_sweep_variable_tree()
+
+    def _update_sweep_case_count(self) -> None:
+        if not hasattr(self, "sweep_case_count_label"):
+            return
+        if not self.sweep_variables:
+            self.sweep_case_count_label.configure(text="Total cases: 0")
+            return
+        try:
+            count = 1
+            for variable in self.sweep_variables.values():
+                count *= len(_sweep_display_values(variable.start, variable.end, variable.step))
+        except ValueError:
+            self.sweep_case_count_label.configure(text="Total cases: incomplete range")
+            return
+        self.sweep_case_count_label.configure(text=f"Total cases: {count:,}")
+
+    def stop_sweep(self) -> None:
+        self._sweep_cancel_requested = True
+        if hasattr(self, "sweep_status_label"):
+            self.sweep_status_label.configure(text="Stopping...")
+
+    def run_sweep(self) -> None:
+        self._commit_focused_form()
+        self._apply_sweep_range_if_selected()
+        if not self.sweep_variables:
+            messagebox.showwarning("No sweep variables", "Select at least one sweep variable.")
+            return
+        if len(self.sweep_variables) > SWEEP_MAX_VARIABLES:
+            messagebox.showerror(
+                "Too many sweep variables",
+                f"Select up to {SWEEP_MAX_VARIABLES} sweep variables.",
+            )
+            return
+
+        try:
+            sweep_grid = self._build_sweep_grid()
+            constraints = self._read_sweep_constraints()
+        except ValueError as exc:
+            messagebox.showerror("Invalid sweep setup", str(exc))
+            return
+
+        total_cases = 1
+        for values in sweep_grid.values():
+            total_cases *= len(values)
+        if total_cases <= 0:
+            messagebox.showerror("Invalid sweep setup", "Sweep range produced no cases.")
+            return
+
+        baseline_node_rows = deepcopy(self.node_rows)
+        baseline_edge_rows = deepcopy(self.edge_rows)
+        variables = list(self.sweep_variables.values())
+        objective_direction = self.sweep_direction.get()
+        objective_label = self._objective_label()
+
+        self._sweep_cancel_requested = False
+        self.sweep_progress.configure(maximum=total_cases, value=0)
+        self.sweep_status_label.configure(text=f"Running 0 / {total_cases:,}")
+        self.sweep_results = []
+        best_record: dict[str, Any] | None = None
+        warnings: list[str] = []
+
+        for case_index, combination in enumerate(product(*sweep_grid.values()), start=1):
+            if self._sweep_cancel_requested:
+                break
+            node_rows = deepcopy(baseline_node_rows)
+            edge_rows = deepcopy(baseline_edge_rows)
+            variable_values: dict[str, float] = {}
+            try:
+                for variable, value_si in zip(variables, combination):
+                    self._apply_sweep_value(node_rows, edge_rows, variable, value_si)
+                    variable_values[variable.label] = self._value_for_variable_unit(
+                        value_si,
+                        variable,
+                    )
+                network = self._build_network_from_data(node_rows, edge_rows)
+                result = self._solve_network(network)
+                objective_value = self._read_objective_value(result)
+                global_metrics = _global_result_metrics(result)
+                feasible, constraint_text = _constraints_pass(global_metrics, constraints)
+                record = {
+                    "case": case_index,
+                    "objective": objective_value,
+                    "objective_label": objective_label,
+                    "feasible": feasible,
+                    "constraint": constraint_text,
+                    "total_dp": global_metrics["total_dp"],
+                    "outlet_T": global_metrics["outlet_T"],
+                    "max_wall_T": global_metrics["max_wall_T"],
+                    "status": "OK",
+                    **variable_values,
+                }
+                if feasible and _is_better_record(
+                    record,
+                    best_record,
+                    objective_direction,
+                ):
+                    best_record = record
+            except Exception as exc:
+                record = {
+                    "case": case_index,
+                    "objective": None,
+                    "objective_label": objective_label,
+                    "feasible": False,
+                    "constraint": str(exc),
+                    "total_dp": None,
+                    "outlet_T": None,
+                    "max_wall_T": None,
+                    "status": "FAILED",
+                    **variable_values,
+                }
+                warnings.append(f"Case {case_index}: {exc}")
+            self.sweep_results.append(record)
+            self.sweep_progress.configure(value=case_index)
+            self.sweep_status_label.configure(
+                text=f"Running {case_index:,} / {total_cases:,}"
+            )
+            self.update_idletasks()
+            self.update()
+
+        stopped = self._sweep_cancel_requested
+        self._sweep_cancel_requested = False
+        self._show_sweep_results(best_record, warnings, stopped)
+
+    def _apply_sweep_range_if_selected(self) -> None:
+        if (
+            self._selected_sweep_variable_id
+            and self._selected_sweep_variable_id in self.sweep_variables
+        ):
+            variable = self.sweep_variables[self._selected_sweep_variable_id]
+            variable.start = self.sweep_range_start.get().strip()
+            variable.end = self.sweep_range_end.get().strip()
+            variable.step = self.sweep_range_step.get().strip()
+            if variable.unit_group is not None and self.sweep_range_unit.get():
+                variable.unit = self.sweep_range_unit.get()
+
+    def _build_sweep_grid(self) -> dict[str, list[float]]:
+        grid: dict[str, list[float]] = {}
+        for variable in self.sweep_variables.values():
+            display_values = _sweep_display_values(
+                variable.start,
+                variable.end,
+                variable.step,
+            )
+            if variable.unit_group is None:
+                grid[variable.target_id] = display_values
+            else:
+                grid[variable.target_id] = [
+                    _to_si(value, variable.unit_group, variable.unit)
+                    for value in display_values
+                ]
+        return grid
+
+    def _read_sweep_constraints(self) -> dict[str, tuple[float | None, float | None]]:
+        constraints: dict[str, tuple[float | None, float | None]] = {}
+        for key, enabled in self._constraint_enabled.items():
+            if not enabled.get():
+                continue
+            _label, unit_group = CONSTRAINT_SPECS[key]
+            unit = self._constraint_units[key].get()
+            min_value = _optional_float(self._constraint_min[key].get())
+            max_value = _optional_float(self._constraint_max[key].get())
+            if min_value is None and max_value is None:
+                raise ValueError(f"{CONSTRAINT_SPECS[key][0]} constraint needs min or max.")
+            constraints[key] = (
+                _to_si(min_value, unit_group, unit) if min_value is not None else None,
+                _to_si(max_value, unit_group, unit) if max_value is not None else None,
+            )
+        return constraints
+
+    def _apply_sweep_value(
+        self,
+        node_rows: list[dict[str, str]],
+        edge_rows: list[dict[str, str]],
+        variable: SweepVariable,
+        value_si: float,
+    ) -> None:
+        if variable.scope == "node":
+            row = next(
+                (item for item in node_rows if item["node_id"] == variable.object_id),
+                None,
+            )
+        else:
+            row = next(
+                (item for item in edge_rows if item["edge_id"] == variable.object_id),
+                None,
+            )
+        if row is None:
+            raise ValueError(f"Sweep target not found: {variable.label}")
+        if variable.unit_group is None:
+            row[variable.row_key] = _fmt_optional(value_si)
+            return
+        row_unit = row.get(_unit_row_key(variable.field_key), _default_unit_for_key(variable.field_key))
+        row[variable.row_key] = _fmt_optional(
+            _from_si(value_si, variable.unit_group, row_unit)
+        )
+
+    def _value_for_variable_unit(
+        self,
+        value_si: float,
+        variable: SweepVariable,
+    ) -> float:
+        if variable.unit_group is None:
+            return value_si
+        return _from_si(value_si, variable.unit_group, variable.unit)
+
+    def _solve_network(self, network: NetworkSpec) -> SolverResult:
+        property_model = self.property_model.get()
+        try:
+            return FixedFlowSolver(
+                network,
+                SolverOptions(property_model=property_model),
+            ).solve()
+        except RuntimeError as exc:
+            if property_model != "coolprop" or "CoolProp" not in str(exc):
+                raise
+            return FixedFlowSolver(
+                network,
+                SolverOptions(property_model="ideal_gas"),
+            ).solve()
+
+    def _read_objective_value(self, result: SolverResult) -> float:
+        scope = self.sweep_objective_scope.get()
+        metric = self.sweep_objective_metric.get()
+        if scope == "Global":
+            metrics = _global_result_metrics(result)
+            if metric not in metrics:
+                raise ValueError(f"Unknown global objective metric: {metric}")
+            return metrics[metric]
+        if scope == "Node":
+            node_id = self.sweep_objective_node.get()
+            if node_id not in result.nodes:
+                raise ValueError(f"Objective node not found: {node_id}")
+            node = result.nodes[node_id]
+            if not hasattr(node, metric):
+                raise ValueError(f"Unknown node objective metric: {metric}")
+            return float(getattr(node, metric))
+        edge_id = self.sweep_objective_edge.get()
+        if edge_id not in result.edges:
+            raise ValueError(f"Objective edge not found: {edge_id}")
+        edge = result.edges[edge_id]
+        if hasattr(edge, metric):
+            return float(getattr(edge, metric))
+        if metric in edge.intermediate:
+            return float(edge.intermediate[metric])
+        raise ValueError(f"Unknown edge objective metric: {metric}")
+
+    def _objective_label(self) -> str:
+        scope = self.sweep_objective_scope.get()
+        metric = self.sweep_objective_metric.get()
+        if scope == "Global":
+            return f"Global / {metric}"
+        if scope == "Node":
+            return f"Node {self.sweep_objective_node.get()} / {metric}"
+        return f"Edge {self.sweep_objective_edge.get()} / {metric}"
+
+    def _show_sweep_results(
+        self,
+        best_record: dict[str, Any] | None,
+        warnings: list[str],
+        stopped: bool,
+    ) -> None:
+        if stopped:
+            self.sweep_status_label.configure(
+                text=f"Stopped after {len(self.sweep_results):,} cases"
+            )
+        else:
+            self.sweep_status_label.configure(
+                text=f"Done: {len(self.sweep_results):,} cases"
+            )
+        if best_record is None:
+            message = "No feasible case found." if self.sweep_results else "No sweep result."
+            if stopped:
+                message = f"Stopped. {message}"
+            self._set_sweep_best_rows([("Status", message)])
+        else:
+            rows = [
+                ("Case", str(best_record["case"])),
+                ("Objective", best_record["objective_label"]),
+                ("Objective value", _fmt_sweep_value(best_record["objective"])),
+                ("Feasible", str(best_record["feasible"])),
+                ("Constraint", best_record["constraint"]),
+                ("Total dp [Pa]", _fmt_sweep_value(best_record["total_dp"])),
+                ("Outlet T [K]", _fmt_sweep_value(best_record["outlet_T"])),
+                ("Max wall T [K]", _fmt_sweep_value(best_record["max_wall_T"])),
+            ]
+            for variable in self.sweep_variables.values():
+                if variable.label in best_record:
+                    suffix = f" [{variable.unit}]" if variable.unit else ""
+                    rows.append(
+                        (
+                            f"{variable.label}{suffix}",
+                            _fmt_sweep_value(best_record[variable.label]),
+                        )
+                    )
+            self._set_sweep_best_rows(rows)
+
+        self._show_sweep_result_table()
+        self._update_sweep_plot_variable_combos()
+        self._update_sweep_plot()
+        if warnings:
+            self._show_warnings(warnings[:200])
+
+    def _set_sweep_best_rows(self, rows: list[tuple[str, str]]) -> None:
+        if not hasattr(self, "sweep_best_tree"):
+            return
+        self.sweep_best_tree.delete(*self.sweep_best_tree.get_children())
+        for index, (item, value) in enumerate(rows):
+            self.sweep_best_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(item, value),
+            )
+
+    def _show_sweep_result_table(self) -> None:
+        variable_labels = [variable.label for variable in self.sweep_variables.values()]
+        columns = (
+            "case",
+            "status",
+            "feasible",
+            "objective",
+            *variable_labels,
+            "total_dp",
+            "outlet_T",
+            "max_wall_T",
+            "constraint",
+        )
+        self._set_sweep_result_columns(list(columns))
+        for index, record in enumerate(self.sweep_results):
+            values = []
+            for column in columns:
+                value = record.get(column)
+                if column in {"case", "status", "feasible", "constraint"}:
+                    values.append(str(value))
+                else:
+                    values.append(_fmt_sweep_value(value))
+            self.sweep_result_tree.insert("", tk.END, iid=str(index), values=values)
+
+    def _set_sweep_result_columns(self, columns: list[str]) -> None:
+        if not hasattr(self, "sweep_result_tree"):
+            return
+        self.sweep_result_tree.delete(*self.sweep_result_tree.get_children())
+        if not columns:
+            columns = ["status"]
+        self.sweep_result_tree.configure(columns=columns)
+        for column in columns:
+            heading = column
+            if column == "total_dp":
+                heading = "total_dp [Pa]"
+            elif column == "outlet_T":
+                heading = "outlet_T [K]"
+            elif column == "max_wall_T":
+                heading = "max_wall_T [K]"
+            self.sweep_result_tree.heading(column, text=heading)
+            width = 120 if column not in {"constraint"} else 220
+            if column in {"case", "status", "feasible"}:
+                width = 80
+            self.sweep_result_tree.column(column, width=width, anchor=tk.W)
+
+    def _update_sweep_plot_variable_combos(self) -> None:
+        if not hasattr(self, "sweep_plot_x_combo"):
+            return
+        labels = tuple(variable.label for variable in self.sweep_variables.values())
+        self.sweep_plot_x_combo.configure(values=labels)
+        self.sweep_plot_y_combo.configure(values=labels)
+        if labels and self.sweep_plot_x.get() not in labels:
+            self.sweep_plot_x.set(labels[0])
+        if len(labels) > 1 and self.sweep_plot_y.get() not in labels:
+            self.sweep_plot_y.set(labels[1])
+        elif len(labels) <= 1:
+            self.sweep_plot_y.set("")
+
+    def _update_sweep_plot(self) -> None:
+        if not hasattr(self, "sweep_plot_frame"):
+            return
+        for child in self.sweep_plot_frame.winfo_children():
+            child.destroy()
+        if not self.sweep_results:
+            ttk.Label(
+                self.sweep_plot_frame,
+                text="Run a sweep to view response plots.",
+                style="Header.TLabel",
+            ).pack(anchor=tk.CENTER, expand=True)
+            return
+        if Figure is None or FigureCanvasTkAgg is None:
+            ttk.Label(
+                self.sweep_plot_frame,
+                text="matplotlib is required for sweep plots.",
+                style="Header.TLabel",
+            ).pack(anchor=tk.CENTER, expand=True)
+            return
+
+        variable_labels = [variable.label for variable in self.sweep_variables.values()]
+        numeric_records = [
+            record
+            for record in self.sweep_results
+            if isinstance(record.get("objective"), (int, float))
+        ]
+        if not variable_labels or not numeric_records:
+            ttk.Label(
+                self.sweep_plot_frame,
+                text="No numeric sweep results to plot.",
+                style="Header.TLabel",
+            ).pack(anchor=tk.CENTER, expand=True)
+            return
+
+        plot_type = self.sweep_plot_type.get()
+        if plot_type == "Auto":
+            plot_type = "Line" if len(variable_labels) == 1 else "Heatmap"
+        x_label = self.sweep_plot_x.get() or variable_labels[0]
+        y_label = self.sweep_plot_y.get() or (
+            variable_labels[1] if len(variable_labels) > 1 else ""
+        )
+        figure = Figure(figsize=(6.8, 4.1), dpi=110, facecolor="#fbfcfe")
+        if plot_type == "Surface" and len(variable_labels) > 1 and y_label:
+            axis = figure.add_subplot(111, projection="3d")
+            self._draw_sweep_surface(axis, numeric_records, x_label, y_label)
+        elif plot_type == "Heatmap" and len(variable_labels) > 1 and y_label:
+            axis = figure.add_subplot(111)
+            image = self._draw_sweep_heatmap(axis, numeric_records, x_label, y_label)
+            if image is not None:
+                figure.colorbar(image, ax=axis, shrink=0.82)
+        elif plot_type == "Scatter" and len(variable_labels) > 1 and y_label:
+            axis = figure.add_subplot(111)
+            scatter = axis.scatter(
+                [float(record[x_label]) for record in numeric_records],
+                [float(record[y_label]) for record in numeric_records],
+                c=[float(record["objective"]) for record in numeric_records],
+                cmap="viridis",
+                edgecolors="#111827",
+                linewidths=0.3,
+            )
+            axis.set_xlabel(x_label)
+            axis.set_ylabel(y_label)
+            axis.set_title(self._objective_label())
+            figure.colorbar(scatter, ax=axis, shrink=0.82)
+        else:
+            axis = figure.add_subplot(111)
+            sorted_records = sorted(numeric_records, key=lambda record: float(record[x_label]))
+            axis.plot(
+                [float(record[x_label]) for record in sorted_records],
+                [float(record["objective"]) for record in sorted_records],
+                marker="o",
+                color=ACCENT_COLOR,
+            )
+            axis.set_xlabel(x_label)
+            axis.set_ylabel("Objective")
+            axis.set_title(self._objective_label())
+        figure.tight_layout()
+        canvas = FigureCanvasTkAgg(figure, master=self.sweep_plot_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._sweep_plot_canvas = canvas
+
+    def _draw_sweep_heatmap(
+        self,
+        axis: Any,
+        records: list[dict[str, Any]],
+        x_label: str,
+        y_label: str,
+    ) -> Any:
+        x_values, y_values, z_grid = _sweep_grid_from_records(
+            records,
+            x_label,
+            y_label,
+            self.sweep_direction.get(),
+        )
+        if not x_values or not y_values:
+            axis.text(0.5, 0.5, "Not enough data", ha="center", va="center")
+            return None
+        image = axis.imshow(
+            z_grid,
+            origin="lower",
+            aspect="auto",
+            cmap="viridis",
+            extent=(min(x_values), max(x_values), min(y_values), max(y_values)),
+        )
+        axis.set_xlabel(x_label)
+        axis.set_ylabel(y_label)
+        axis.set_title(self._objective_label())
+        return image
+
+    def _draw_sweep_surface(
+        self,
+        axis: Any,
+        records: list[dict[str, Any]],
+        x_label: str,
+        y_label: str,
+    ) -> None:
+        x_values, y_values, z_grid = _sweep_grid_from_records(
+            records,
+            x_label,
+            y_label,
+            self.sweep_direction.get(),
+        )
+        if not x_values or not y_values:
+            axis.text2D(0.5, 0.5, "Not enough data", ha="center", va="center")
+            return
+        try:
+            import numpy as np
+        except ImportError:
+            axis.text2D(0.5, 0.5, "numpy is required for surface plots", ha="center", va="center")
+            return
+        x_mesh = [[x for x in x_values] for _y in y_values]
+        y_mesh = [[y for _x in x_values] for y in y_values]
+        axis.plot_surface(
+            np.array(x_mesh),
+            np.array(y_mesh),
+            np.array(z_grid),
+            cmap="viridis",
+            edgecolor="none",
+        )
+        axis.set_xlabel(x_label)
+        axis.set_ylabel(y_label)
+        axis.set_zlabel("Objective")
+        axis.set_title(self._objective_label())
 
     def _on_node_select(self, _event: tk.Event) -> None:
         index = self._selected_index(self.node_tree)
@@ -2778,6 +4094,7 @@ class PassageApp(tk.Tk):
         finally:
             self._suppress_auto_apply = False
         self._update_node_field_visibility()
+        self._sync_sweep_checkboxes()
 
     def _populate_edge_form(self, index: int) -> None:
         row = self.edge_rows[index]
@@ -2798,6 +4115,7 @@ class PassageApp(tk.Tk):
         self._update_wall_field_visibility()
         self.params_text.delete("1.0", tk.END)
         self.params_text.insert("1.0", row["params_text"])
+        self._sync_sweep_checkboxes()
 
     def apply_node(self) -> None:
         index = self._selected_index(self.node_tree)
@@ -3050,6 +4368,13 @@ class PassageApp(tk.Tk):
             messagebox.showerror("Calculation failed", str(exc))
 
     def _build_network_from_rows(self) -> NetworkSpec:
+        return self._build_network_from_data(self.node_rows, self.edge_rows)
+
+    def _build_network_from_data(
+        self,
+        node_rows: list[dict[str, str]],
+        edge_rows: list[dict[str, str]],
+    ) -> NetworkSpec:
         nodes = [
             NodeSpec(
                 node_id=row["node_id"],
@@ -3058,10 +4383,10 @@ class PassageApp(tk.Tk):
                 inlet_temperature=_optional_si(row, "inlet_temperature") if row["kind"] == "inlet" else None,
                 inlet_pressure=_optional_si(row, "inlet_pressure") if row["kind"] == "inlet" else None,
             )
-            for row in self.node_rows
+            for row in node_rows
         ]
         edges: list[EdgeSpec] = []
-        for row in self.edge_rows:
+        for row in edge_rows:
             geometry = Geometry(
                 length=_required_si(row, "length", f'{row["edge_id"]}.length'),
                 shape=row["shape"],  # type: ignore[arg-type]
@@ -3133,6 +4458,7 @@ class PassageApp(tk.Tk):
             )
         self._update_selected_result_panel()
         self._redraw_layout_canvas()
+        self._update_sweep_objective_controls(preserve_metric=True)
 
     def _update_selected_result_panel(self) -> None:
         if not hasattr(self, "selected_result_tree"):
@@ -3867,6 +5193,176 @@ def _fmt_param_value(value: Any) -> str:
 
 def _fmt_number(value: float, digits: int) -> str:
     return f"{value:,.{digits}f}"
+
+
+def _fmt_sweep_value(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{value:,.6g}"
+    return str(value)
+
+
+def _field_label(key: str) -> str:
+    labels = {
+        "inlet_mdot": "Inlet m_dot",
+        "inlet_temperature": "Inlet temperature",
+        "inlet_pressure": "Inlet pressure",
+        "length": "Length",
+        "width": "Width",
+        "height": "Height",
+        "diameter": "Diameter",
+        "wall_temperature": "Wall T",
+        "heat_flux": "Heat flux",
+        "external_temperature": "External gas T",
+        "external_htc": "External h",
+        "wall_thickness": "Blade wall thickness",
+        "wall_conductivity": "Blade wall k",
+        "tbc_thickness": "TBC thickness",
+        "tbc_conductivity": "TBC k",
+    }
+    if key in labels:
+        return labels[key]
+    for specs in TECH_PARAM_SPECS.values():
+        for spec in specs:
+            if spec.key == key:
+                return spec.label
+    return key
+
+
+def _sweep_display_values(start: str, end: str, step: str) -> list[float]:
+    start_value = _required_float(start, "sweep start")
+    end_value = _required_float(end, "sweep end")
+    step_value = _optional_float(step)
+    if abs(end_value - start_value) <= 1.0e-12 and step_value is None:
+        return [start_value]
+    if step_value is None:
+        raise ValueError("Sweep step is required unless start and end are equal.")
+    if step_value <= 0.0:
+        raise ValueError("Sweep step must be positive.")
+
+    direction = 1.0 if end_value >= start_value else -1.0
+    signed_step = direction * step_value
+    tolerance = abs(step_value) * 1.0e-9 + 1.0e-12
+    values: list[float] = []
+    value = start_value
+    if direction > 0.0:
+        while value <= end_value + tolerance:
+            values.append(value)
+            value += signed_step
+    else:
+        while value >= end_value - tolerance:
+            values.append(value)
+            value += signed_step
+    return values
+
+
+def _global_result_metrics(result: SolverResult) -> dict[str, float]:
+    outlet_nodes = [
+        node
+        for node in result.nodes.values()
+        if node.kind == "outlet" or not node.outgoing_edges
+    ]
+    inlet_pressures = [
+        node.pressure for node in result.nodes.values() if node.kind == "inlet"
+    ]
+    outlet_pressure = min((node.pressure for node in outlet_nodes), default=0.0)
+    outlet_mdot = sum(node.mass_flow for node in outlet_nodes)
+    outlet_temperature = 0.0
+    if outlet_mdot > 0.0:
+        outlet_temperature = (
+            sum(node.mass_flow * node.temperature for node in outlet_nodes)
+            / outlet_mdot
+        )
+    total_dp = max(inlet_pressures, default=0.0) - outlet_pressure
+    return {
+        "outlet_pressure": outlet_pressure,
+        "total_dp": total_dp,
+        "outlet_T": outlet_temperature,
+        "max_wall_T": _max_wall_temperature(result),
+    }
+
+
+def _max_wall_temperature(result: SolverResult) -> float:
+    candidates: list[float] = []
+    for edge in result.edges.values():
+        for key in (
+            "coolant_side_wall_temperature_k",
+            "metal_outer_temperature_k",
+            "tbc_outer_temperature_k",
+        ):
+            value = edge.intermediate.get(key)
+            if isinstance(value, (int, float)):
+                candidates.append(float(value))
+    return max(candidates, default=0.0)
+
+
+def _constraints_pass(
+    metrics: dict[str, float],
+    constraints: dict[str, tuple[float | None, float | None]],
+) -> tuple[bool, str]:
+    failures: list[str] = []
+    for key, (lower, upper) in constraints.items():
+        value = metrics.get(key)
+        label = CONSTRAINT_SPECS[key][0]
+        if value is None:
+            failures.append(f"{label}: unavailable")
+            continue
+        if lower is not None and value < lower:
+            failures.append(f"{label}: {value:,.6g} < {lower:,.6g}")
+        if upper is not None and value > upper:
+            failures.append(f"{label}: {value:,.6g} > {upper:,.6g}")
+    return not failures, "OK" if not failures else "; ".join(failures)
+
+
+def _is_better_record(
+    record: dict[str, Any],
+    best_record: dict[str, Any] | None,
+    direction: str,
+) -> bool:
+    value = record.get("objective")
+    if not isinstance(value, (int, float)):
+        return False
+    if best_record is None:
+        return True
+    best_value = best_record.get("objective")
+    if not isinstance(best_value, (int, float)):
+        return True
+    if direction == "Maximize":
+        return value > best_value
+    return value < best_value
+
+
+def _sweep_grid_from_records(
+    records: list[dict[str, Any]],
+    x_label: str,
+    y_label: str,
+    direction: str,
+) -> tuple[list[float], list[float], list[list[float]]]:
+    x_values = sorted({float(record[x_label]) for record in records if x_label in record})
+    y_values = sorted({float(record[y_label]) for record in records if y_label in record})
+    best_by_point: dict[tuple[float, float], float] = {}
+    for record in records:
+        if x_label not in record or y_label not in record:
+            continue
+        objective = record.get("objective")
+        if not isinstance(objective, (int, float)):
+            continue
+        point = (float(record[x_label]), float(record[y_label]))
+        current = best_by_point.get(point)
+        if current is None:
+            best_by_point[point] = float(objective)
+        elif direction == "Maximize" and objective > current:
+            best_by_point[point] = float(objective)
+        elif direction != "Maximize" and objective < current:
+            best_by_point[point] = float(objective)
+    grid = [
+        [best_by_point.get((x_value, y_value), float("nan")) for x_value in x_values]
+        for y_value in y_values
+    ]
+    return x_values, y_values, grid
 
 
 def _write_result_csv(path: Path, result: SolverResult) -> None:

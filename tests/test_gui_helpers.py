@@ -7,10 +7,12 @@ from internal_passage_1d.gui import (
     _auto_node_positions,
     _point_to_segment_distance,
     _edge_to_row,
+    _global_result_metrics,
     _optional_si,
     _params_from_row,
     _param_row_key,
     _parse_params,
+    _sweep_display_values,
     _unit_row_key,
     _unique_id,
 )
@@ -92,6 +94,28 @@ class GuiHelperTest(unittest.TestCase):
         edge = next(edge for edge in network.edges if edge.edge_id == "4_to_5")
 
         self.assertAlmostEqual(edge.geometry.height, 0.017)
+
+    def test_sweep_display_values_include_directional_steps(self) -> None:
+        self.assertEqual(_sweep_display_values("0", "0.2", "0.1"), [0.0, 0.1, 0.2])
+        self.assertEqual(_sweep_display_values("3", "1", "1"), [3.0, 2.0, 1.0])
+        self.assertEqual(_sweep_display_values("5", "5", ""), [5.0])
+
+    def test_global_result_metrics_include_constraints_and_objectives(self) -> None:
+        from internal_passage_1d import FixedFlowSolver, SolverOptions
+
+        result = FixedFlowSolver(
+            build_default_network(),
+            SolverOptions(property_model="ideal_gas"),
+        ).solve()
+
+        metrics = _global_result_metrics(result)
+
+        self.assertIn("outlet_pressure", metrics)
+        self.assertIn("total_dp", metrics)
+        self.assertIn("outlet_T", metrics)
+        self.assertIn("max_wall_T", metrics)
+        self.assertGreater(metrics["outlet_pressure"], 0.0)
+        self.assertGreater(metrics["total_dp"], 0.0)
 
     def test_default_node_positions_cover_sample_inlets(self) -> None:
         self.assertIn("1-1", DEFAULT_NODE_POSITIONS)
