@@ -32,6 +32,10 @@ class FixedFlowExampleTest(unittest.TestCase):
         self.assertEqual(result.edges["7_to_8"].intermediate["row_count"], 6)
         self.assertEqual(result.edges["7_to_8"].intermediate["pins_cross"], 10)
         self.assertEqual(result.edges["1-1_to_2"].intermediate["wall_mode"], "external_convection")
+        self.assertAlmostEqual(
+            result.edges["2_to_3"].intermediate["coolant_bulk_temperature_k"],
+            result.edges["2_to_3"].inlet_temperature,
+        )
         self.assertGreater(
             result.edges["1-1_to_2"].intermediate["coolant_side_wall_temperature_k"],
             result.edges["1-1_to_2"].inlet_temperature,

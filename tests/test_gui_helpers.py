@@ -7,9 +7,11 @@ from internal_passage_1d.gui import (
     _auto_node_positions,
     _point_to_segment_distance,
     _edge_to_row,
+    _optional_si,
     _params_from_row,
     _param_row_key,
     _parse_params,
+    _unit_row_key,
     _unique_id,
 )
 from internal_passage_1d.sample_cases import build_default_network
@@ -59,6 +61,37 @@ class GuiHelperTest(unittest.TestCase):
         self.assertEqual(params["custom_loss"], 3.2)
         self.assertEqual(params["c_nu"], 1.4)
         self.assertEqual(params["turn_angle_deg"], 180)
+
+    def test_unit_conversions_are_applied_to_si_helpers(self) -> None:
+        length_row = {"length": "25.4", _unit_row_key("length"): "mm"}
+        temperature_row = {
+            "inlet_temperature": "421.73",
+            _unit_row_key("inlet_temperature"): "F",
+        }
+
+        self.assertAlmostEqual(_optional_si(length_row, "length"), 0.0254)
+        self.assertAlmostEqual(
+            _optional_si(temperature_row, "inlet_temperature"),
+            489.6666666667,
+        )
+
+    def test_params_from_row_converts_unit_aware_parameters(self) -> None:
+        row = {
+            "cooling_technology": "pin_fin",
+            "params_text": "",
+            _param_row_key("pin_diameter"): "4",
+            _unit_row_key("pin_diameter"): "mm",
+        }
+
+        params = _params_from_row(row)
+
+        self.assertAlmostEqual(params["pin_diameter"], 0.004)
+
+    def test_default_example_uses_corrected_four_to_five_height(self) -> None:
+        network = build_default_network()
+        edge = next(edge for edge in network.edges if edge.edge_id == "4_to_5")
+
+        self.assertAlmostEqual(edge.geometry.height, 0.017)
 
     def test_default_node_positions_cover_sample_inlets(self) -> None:
         self.assertIn("1-1", DEFAULT_NODE_POSITIONS)

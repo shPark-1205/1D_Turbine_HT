@@ -46,6 +46,37 @@ OVERLAY_METRICS = (
     "Node T [K]",
     "Node P [Pa]",
 )
+UNIT_OPTIONS = {
+    "length": ("m", "cm", "mm", "um", "in", "ft"),
+    "pressure": ("Pa", "kPa", "MPa", "bar", "psi"),
+    "temperature": ("K", "C", "F", "R"),
+    "mass_flow": ("kg/s", "g/s", "kg/min", "g/min", "lb/s", "lb/min"),
+    "thermal_conductivity": ("W/m/K", "BTU/h/ft/F"),
+    "heat_flux": ("W/m2", "kW/m2", "MW/m2", "BTU/h/ft2"),
+    "htc": ("W/m2/K", "kW/m2/K", "BTU/h/ft2/F"),
+}
+FIELD_UNIT_GROUPS = {
+    "inlet_mdot": "mass_flow",
+    "inlet_temperature": "temperature",
+    "inlet_pressure": "pressure",
+    "length": "length",
+    "width": "length",
+    "height": "length",
+    "diameter": "length",
+    "wall_temperature": "temperature",
+    "heat_flux": "heat_flux",
+    "external_temperature": "temperature",
+    "external_htc": "htc",
+    "wall_thickness": "length",
+    "wall_conductivity": "thermal_conductivity",
+    "tbc_thickness": "length",
+    "tbc_conductivity": "thermal_conductivity",
+    "radius_m": "length",
+    "pin_diameter": "length",
+    "pin_height": "length",
+    "pitch_x": "length",
+    "pitch_s": "length",
+}
 IMAGE_FILETYPES = (
     ("Image files", "*.png *.jpg *.jpeg *.gif *.ppm *.pgm"),
     ("PNG files", "*.png"),
@@ -88,7 +119,7 @@ TECH_PARAM_SPECS: dict[str, tuple[ParamSpec, ...]] = {
         ParamSpec("e_over_dh", "Rib e/Dh [-]"),
         ParamSpec("p_over_e", "Rib pitch/e [-]"),
         ParamSpec("angle_deg", "Rib angle [deg]", "45"),
-        ParamSpec("radius_m", "Blade radius [m]", "1.23"),
+        ParamSpec("radius_m", "Blade radius", "1.23"),
         ParamSpec("rpm", "Blade RPM", "3000"),
         ParamSpec("c_rotation", "C_rotation [-]", "1.056"),
         ParamSpec("ribbed_walls", "Ribbed walls", "2"),
@@ -98,10 +129,10 @@ TECH_PARAM_SPECS: dict[str, tuple[ParamSpec, ...]] = {
         ParamSpec("turn_angle_deg", "Turn angle [deg]", "180"),
     ),
     "pin_fin": (
-        ParamSpec("pin_diameter", "Pin diameter [m]"),
-        ParamSpec("pin_height", "Pin height [m]"),
-        ParamSpec("pitch_x", "Streamwise pitch X [m]"),
-        ParamSpec("pitch_s", "Spanwise pitch S [m]"),
+        ParamSpec("pin_diameter", "Pin diameter"),
+        ParamSpec("pin_height", "Pin height"),
+        ParamSpec("pitch_x", "Streamwise pitch X"),
+        ParamSpec("pitch_s", "Spanwise pitch S"),
     ),
 }
 ALL_PARAM_KEYS = tuple(
@@ -110,6 +141,24 @@ ALL_PARAM_KEYS = tuple(
         for specs in TECH_PARAM_SPECS.values()
         for spec in specs
     )
+)
+NODE_UNIT_KEYS = ("inlet_mdot", "inlet_temperature", "inlet_pressure")
+EDGE_FIELD_UNIT_KEYS = (
+    "length",
+    "width",
+    "height",
+    "diameter",
+    "wall_temperature",
+    "heat_flux",
+    "external_temperature",
+    "external_htc",
+    "wall_thickness",
+    "wall_conductivity",
+    "tbc_thickness",
+    "tbc_conductivity",
+)
+EDGE_UNIT_KEYS = EDGE_FIELD_UNIT_KEYS + tuple(
+    key for key in ALL_PARAM_KEYS if key in FIELD_UNIT_GROUPS
 )
 
 
@@ -144,10 +193,21 @@ class PassageApp(tk.Tk):
         self._correlations_scroll_canvas: tk.Canvas | None = None
         self._formula_images: list[Any] = []
         self.results_stale = False
+        self._focused_form: str | None = None
+        self._is_committing_form = False
+        self._suppress_stale_mark = False
 
         self.property_model = tk.StringVar(value="ideal_gas")
         self.overlay_metric = tk.StringVar(value="Technology")
         self.auto_calculate = tk.BooleanVar(value=False)
+        self._unit_vars = {
+            key: tk.StringVar(value=_default_unit_for_key(key))
+            for key in FIELD_UNIT_GROUPS
+        }
+        self._last_unit_values = {
+            key: variable.get()
+            for key, variable in self._unit_vars.items()
+        }
 
         self._node_vars = {
             "node_id": tk.StringVar(),
@@ -546,7 +606,13 @@ class PassageApp(tk.Tk):
         ttk.Label(node_panel, text="Selected Node", style="Section.TLabel").grid(
             row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8)
         )
-        self._labeled_entry(node_panel, 1, "Node ID", self._node_vars["node_id"])
+        self._labeled_entry(
+            node_panel,
+            1,
+            "Node ID",
+            self._node_vars["node_id"],
+            form="node",
+        )
         ttk.Label(node_panel, text="Kind", style="Header.TLabel").grid(
             row=2, column=0, sticky=tk.W, pady=3
         )
@@ -561,20 +627,26 @@ class PassageApp(tk.Tk):
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
             3,
-            "Inlet m_dot [kg/s]",
+            "Inlet m_dot",
             self._node_vars["inlet_mdot"],
+            form="node",
+            unit_key="inlet_mdot",
         ))
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
             4,
-            "Inlet temperature [K]",
+            "Inlet temperature",
             self._node_vars["inlet_temperature"],
+            form="node",
+            unit_key="inlet_temperature",
         ))
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
             5,
-            "Inlet pressure [Pa]",
+            "Inlet pressure",
             self._node_vars["inlet_pressure"],
+            form="node",
+            unit_key="inlet_pressure",
         ))
         node_panel.columnconfigure(1, weight=1)
 
@@ -594,12 +666,32 @@ class PassageApp(tk.Tk):
             row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8)
         )
         row = 1
-        self._labeled_entry(edge_panel, row, "Edge ID", self._edge_vars["edge_id"])
+        self._labeled_entry(
+            edge_panel,
+            row,
+            "Edge ID",
+            self._edge_vars["edge_id"],
+            form="edge",
+        )
         row += 1
-        self._labeled_combo(edge_panel, row, "From node", self._edge_vars["from_node"], ())
+        self._labeled_combo(
+            edge_panel,
+            row,
+            "From node",
+            self._edge_vars["from_node"],
+            (),
+            form="edge",
+        )
         self.edge_from_combo = edge_panel.grid_slaves(row=row, column=1)[0]
         row += 1
-        self._labeled_combo(edge_panel, row, "To node", self._edge_vars["to_node"], ())
+        self._labeled_combo(
+            edge_panel,
+            row,
+            "To node",
+            self._edge_vars["to_node"],
+            (),
+            form="edge",
+        )
         self.edge_to_combo = edge_panel.grid_slaves(row=row, column=1)[0]
         row += 1
         self._labeled_combo(
@@ -614,36 +706,40 @@ class PassageApp(tk.Tk):
         row += 1
         self.edge_geometry_fields = {}
         for label, key in (
-            ("Length [m]", "length"),
-            ("Width [m]", "width"),
-            ("Height [m]", "height"),
-            ("Diameter [m]", "diameter"),
+            ("Length", "length"),
+            ("Width", "width"),
+            ("Height", "height"),
+            ("Diameter", "diameter"),
         ):
             self.edge_geometry_fields[key] = self._labeled_entry(
                 edge_panel,
                 row,
                 label,
                 self._edge_vars[key],
+                form="edge",
+                unit_key=key,
             )
             row += 1
         self._labeled_combo(edge_panel, row, "Wall mode", self._edge_vars["wall_mode"], WALL_MODES)
         row += 1
         self.edge_wall_fields = {}
         for label, key in (
-            ("Wall T [K]", "wall_temperature"),
-            ("Heat flux [W/m2]", "heat_flux"),
-            ("External gas T [K]", "external_temperature"),
-            ("External h [W/m2-K]", "external_htc"),
-            ("Blade wall thickness [m]", "wall_thickness"),
-            ("Blade wall k [W/m-K]", "wall_conductivity"),
-            ("TBC thickness [m]", "tbc_thickness"),
-            ("TBC k [W/m-K]", "tbc_conductivity"),
+            ("Wall T", "wall_temperature"),
+            ("Heat flux", "heat_flux"),
+            ("External gas T", "external_temperature"),
+            ("External h", "external_htc"),
+            ("Blade wall thickness", "wall_thickness"),
+            ("Blade wall k", "wall_conductivity"),
+            ("TBC thickness", "tbc_thickness"),
+            ("TBC k", "tbc_conductivity"),
         ):
             self.edge_wall_fields[key] = self._labeled_entry(
                 edge_panel,
                 row,
                 label,
                 self._edge_vars[key],
+                form="edge",
+                unit_key=key,
             )
             row += 1
 
@@ -1537,6 +1633,7 @@ class PassageApp(tk.Tk):
                 "inlet_mdot": "",
                 "inlet_temperature": "",
                 "inlet_pressure": "",
+                **_unit_defaults_for_keys(NODE_UNIT_KEYS),
             }
         )
         self.node_positions[node_id] = position
@@ -1598,6 +1695,7 @@ class PassageApp(tk.Tk):
             "flow_fraction": "",
             "fixed_mdot": "",
             "params_text": "",
+            **_unit_defaults_for_keys(EDGE_UNIT_KEYS),
             **_default_param_row("smooth"),
         }
 
@@ -2145,14 +2243,37 @@ class PassageApp(tk.Tk):
         row: int,
         label: str,
         variable: tk.StringVar,
-    ) -> tuple[ttk.Label, ttk.Entry]:
+        form: str | None = None,
+        unit_key: str | None = None,
+    ) -> tuple[ttk.Label, tk.Widget]:
         label_widget = ttk.Label(parent, text=label)
         label_widget.grid(row=row, column=0, sticky=tk.W, pady=3)
-        entry = ttk.Entry(parent, textvariable=variable)
-        entry.grid(
-            row=row, column=1, sticky=tk.EW, pady=3
+        unit_group = _unit_group_for_key(unit_key)
+        if unit_group is None:
+            entry = ttk.Entry(parent, textvariable=variable)
+            entry.grid(row=row, column=1, sticky=tk.EW, pady=3)
+            self._bind_entry_commit(entry, form)
+            return label_widget, entry
+
+        value_frame = ttk.Frame(parent)
+        value_frame.grid(row=row, column=1, sticky=tk.EW, pady=3)
+        value_frame.columnconfigure(0, weight=1)
+        entry = ttk.Entry(value_frame, textvariable=variable)
+        entry.grid(row=0, column=0, sticky=tk.EW)
+        self._bind_entry_commit(entry, form)
+        unit_combo = ttk.Combobox(
+            value_frame,
+            textvariable=self._unit_vars[unit_key],
+            values=UNIT_OPTIONS[unit_group],
+            state="readonly",
+            width=13,
         )
-        return label_widget, entry
+        unit_combo.grid(row=0, column=1, sticky=tk.E, padx=(6, 0))
+        unit_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event, key=unit_key, form=form: self._on_unit_change(key, form),
+        )
+        return label_widget, value_frame
 
     def _labeled_combo(
         self,
@@ -2161,14 +2282,58 @@ class PassageApp(tk.Tk):
         label: str,
         variable: tk.StringVar,
         values: tuple[str, ...],
+        form: str | None = None,
     ) -> tuple[ttk.Label, ttk.Combobox]:
         label_widget = ttk.Label(parent, text=label)
         label_widget.grid(row=row, column=0, sticky=tk.W, pady=3)
-        combo = ttk.Combobox(parent, textvariable=variable, values=values, width=20)
-        combo.grid(
-            row=row, column=1, sticky=tk.EW, pady=3
+        combo = ttk.Combobox(
+            parent,
+            textvariable=variable,
+            values=values,
+            state="readonly",
+            width=20,
         )
+        combo.grid(row=row, column=1, sticky=tk.EW, pady=3)
+        if form is not None:
+            combo.bind(
+                "<FocusIn>",
+                lambda _event, form=form: setattr(self, "_focused_form", form),
+                add="+",
+            )
+            combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _event, form=form: self._commit_form_edit(form),
+            )
+            combo.bind(
+                "<FocusOut>",
+                lambda _event, form=form: self._commit_form_edit(form),
+                add="+",
+            )
+            combo.bind(
+                "<Return>",
+                lambda _event, form=form: self._commit_form_edit(form),
+                add="+",
+            )
         return label_widget, combo
+
+    def _bind_entry_commit(self, entry: ttk.Entry, form: str | None) -> None:
+        if form is None:
+            return
+        entry.bind(
+            "<FocusIn>",
+            lambda _event, form=form: setattr(self, "_focused_form", form),
+            add="+",
+        )
+        entry.bind(
+            "<FocusOut>",
+            lambda _event, form=form: self._commit_form_edit(form),
+            add="+",
+        )
+        entry.bind(
+            "<Return>",
+            lambda _event, form=form: self._commit_form_edit(form),
+            add="+",
+        )
 
     def _on_technology_change(self, *_args: object) -> None:
         if self._syncing_edge_form:
@@ -2219,14 +2384,89 @@ class PassageApp(tk.Tk):
         self._auto_apply_node_form()
 
     def _install_form_traces(self) -> None:
-        for key, variable in self._node_vars.items():
-            if key != "kind":
-                variable.trace_add("write", lambda *_args: self._auto_apply_node_form())
-        for key, variable in self._edge_vars.items():
-            if key not in {"cooling_technology", "shape", "wall_mode"}:
-                variable.trace_add("write", lambda *_args: self._auto_apply_edge_form())
-        for variable in self._tech_param_vars.values():
-            variable.trace_add("write", lambda *_args: self._auto_apply_edge_form())
+        # Entry widgets commit on focus-out/Enter so typing remains uninterrupted.
+        return
+
+    def _commit_form_edit(self, form: str | None, mark_stale: bool = True) -> None:
+        if (
+            form is None
+            or self._suppress_auto_apply
+            or self._is_committing_form
+        ):
+            return
+        self._is_committing_form = True
+        previous_suppress_stale = self._suppress_stale_mark
+        self._suppress_stale_mark = previous_suppress_stale or not mark_stale
+        try:
+            if form == "node":
+                self._auto_apply_node_form()
+            elif form == "edge":
+                self._auto_apply_edge_form()
+        finally:
+            self._suppress_stale_mark = previous_suppress_stale
+            self._is_committing_form = False
+
+    def _commit_focused_form(self) -> None:
+        self._commit_form_edit(self._focused_form)
+
+    def _on_unit_change(self, key: str, form: str | None) -> None:
+        unit_group = _unit_group_for_key(key)
+        if unit_group is None:
+            return
+        variable = self._value_var_for_unit_key(key)
+        if variable is None:
+            self._last_unit_values[key] = self._unit_vars[key].get()
+            return
+        old_unit = self._last_unit_values.get(key, _default_unit_for_key(key))
+        new_unit = self._unit_vars[key].get()
+        raw_value = variable.get().strip()
+        if raw_value:
+            try:
+                si_value = _to_si(_required_float(raw_value, key), unit_group, old_unit)
+                display_value = _from_si(si_value, unit_group, new_unit)
+            except ValueError:
+                self._last_unit_values[key] = new_unit
+                return
+            self._suppress_auto_apply = True
+            try:
+                variable.set(_fmt_optional(display_value))
+            finally:
+                self._suppress_auto_apply = False
+        self._last_unit_values[key] = new_unit
+        self._commit_form_edit(form, mark_stale=False)
+
+    def _value_var_for_unit_key(self, key: str) -> tk.StringVar | None:
+        if key in self._node_vars:
+            return self._node_vars[key]
+        if key in self._edge_vars:
+            return self._edge_vars[key]
+        if key in self._tech_param_vars:
+            return self._tech_param_vars[key]
+        return None
+
+    def _unit_row_values(self, keys: tuple[str, ...]) -> dict[str, str]:
+        return {
+            _unit_row_key(key): self._unit_vars[key].get()
+            for key in keys
+            if key in self._unit_vars
+        }
+
+    def _set_unit_vars_from_row(
+        self,
+        row: dict[str, str],
+        keys: tuple[str, ...],
+    ) -> None:
+        for key in keys:
+            if key not in self._unit_vars:
+                continue
+            unit_group = _unit_group_for_key(key)
+            if unit_group is None:
+                continue
+            unit = row.get(_unit_row_key(key), _default_unit_for_key(key))
+            if unit not in UNIT_OPTIONS[unit_group]:
+                unit = _default_unit_for_key(key)
+            self._unit_vars[key].set(unit)
+            self._last_unit_values[key] = unit
 
     def _update_node_field_visibility(self) -> None:
         if not hasattr(self, "node_inlet_fields"):
@@ -2297,6 +2537,7 @@ class PassageApp(tk.Tk):
         if index is None or index >= len(self.node_rows):
             return
         row = {key: variable.get().strip() for key, variable in self._node_vars.items()}
+        row.update(self._unit_row_values(NODE_UNIT_KEYS))
         if not row["node_id"] or self._id_exists(row["node_id"], self.node_rows, index, "node_id"):
             return
         if row["kind"] != "inlet":
@@ -2382,11 +2623,39 @@ class PassageApp(tk.Tk):
             ttk.Label(self.tech_param_frame, text=spec.label).grid(
                 row=row, column=0, sticky=tk.W, pady=2
             )
-            ttk.Entry(
-                self.tech_param_frame,
+            unit_group = _unit_group_for_key(spec.key)
+            if unit_group is None:
+                entry = ttk.Entry(
+                    self.tech_param_frame,
+                    textvariable=self._tech_param_vars[spec.key],
+                    width=20,
+                )
+                entry.grid(row=row, column=1, sticky=tk.EW, pady=2, padx=(8, 0))
+                self._bind_entry_commit(entry, "edge")
+                continue
+
+            value_frame = ttk.Frame(self.tech_param_frame)
+            value_frame.grid(row=row, column=1, sticky=tk.EW, pady=2, padx=(8, 0))
+            value_frame.columnconfigure(0, weight=1)
+            entry = ttk.Entry(
+                value_frame,
                 textvariable=self._tech_param_vars[spec.key],
                 width=20,
-            ).grid(row=row, column=1, sticky=tk.EW, pady=2, padx=(8, 0))
+            )
+            entry.grid(row=0, column=0, sticky=tk.EW)
+            self._bind_entry_commit(entry, "edge")
+            unit_combo = ttk.Combobox(
+                value_frame,
+                textvariable=self._unit_vars[spec.key],
+                values=UNIT_OPTIONS[unit_group],
+                state="readonly",
+                width=13,
+            )
+            unit_combo.grid(row=0, column=1, sticky=tk.E, padx=(6, 0))
+            unit_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _event, key=spec.key: self._on_unit_change(key, "edge"),
+            )
         self.tech_param_frame.columnconfigure(1, weight=1)
 
     def load_example(self) -> None:
@@ -2425,9 +2694,9 @@ class PassageApp(tk.Tk):
                 values=(
                     row["node_id"],
                     row["kind"],
-                    row["inlet_mdot"],
-                    row["inlet_temperature"],
-                    row["inlet_pressure"],
+                    _fmt_row_si(row, "inlet_mdot"),
+                    _fmt_row_si(row, "inlet_temperature"),
+                    _fmt_row_si(row, "inlet_pressure"),
                 ),
             )
 
@@ -2440,17 +2709,17 @@ class PassageApp(tk.Tk):
                     row["edge_id"],
                     f'{row["from_node"]} -> {row["to_node"]}',
                     row["cooling_technology"],
-                    row["length"],
+                    _fmt_row_si(row, "length"),
                 )
             else:
                 values = (
                     row["edge_id"],
                     f'{row["from_node"]} -> {row["to_node"]}',
                     row["cooling_technology"],
-                    row["length"],
-                    row["width"],
-                    row["height"],
-                    row["diameter"],
+                    _fmt_row_si(row, "length"),
+                    _fmt_row_si(row, "width"),
+                    _fmt_row_si(row, "height"),
+                    _fmt_row_si(row, "diameter"),
                 )
             self.edge_tree.insert(
                 "",
@@ -2503,6 +2772,7 @@ class PassageApp(tk.Tk):
         row = self.node_rows[index]
         self._suppress_auto_apply = True
         try:
+            self._set_unit_vars_from_row(row, NODE_UNIT_KEYS)
             for key, variable in self._node_vars.items():
                 variable.set(row[key])
         finally:
@@ -2514,6 +2784,7 @@ class PassageApp(tk.Tk):
         self._syncing_edge_form = True
         self._suppress_auto_apply = True
         try:
+            self._set_unit_vars_from_row(row, EDGE_UNIT_KEYS)
             for key, variable in self._edge_vars.items():
                 variable.set(row[key])
             for key, variable in self._tech_param_vars.items():
@@ -2535,6 +2806,7 @@ class PassageApp(tk.Tk):
             return
         old_id = self.node_rows[index]["node_id"]
         row = {key: variable.get().strip() for key, variable in self._node_vars.items()}
+        row.update(self._unit_row_values(NODE_UNIT_KEYS))
         if not row["node_id"]:
             messagebox.showerror("Invalid node", "Node ID is required.")
             return
@@ -2571,6 +2843,7 @@ class PassageApp(tk.Tk):
                 "inlet_mdot": "",
                 "inlet_temperature": "",
                 "inlet_pressure": "",
+                **_unit_defaults_for_keys(NODE_UNIT_KEYS),
             }
         )
         self._ensure_node_positions()
@@ -2692,10 +2965,13 @@ class PassageApp(tk.Tk):
         row["fixed_mdot"] = ""
         for key, variable in self._tech_param_vars.items():
             row[_param_row_key(key)] = variable.get().strip()
+        row.update(self._unit_row_values(EDGE_UNIT_KEYS))
         row["params_text"] = self.params_text.get("1.0", tk.END).strip()
         return row
 
     def _after_apply(self) -> None:
+        if self._suppress_stale_mark:
+            return
         if self.auto_calculate.get():
             self.calculate(show_success=False)
         else:
@@ -2713,6 +2989,7 @@ class PassageApp(tk.Tk):
         self._redraw_layout_canvas()
 
     def calculate(self, show_success: bool = True) -> None:
+        self._commit_focused_form()
         try:
             network = self._build_network_from_rows()
             property_model = self.property_model.get()
@@ -2777,31 +3054,31 @@ class PassageApp(tk.Tk):
             NodeSpec(
                 node_id=row["node_id"],
                 kind=row["kind"],  # type: ignore[arg-type]
-                inlet_mdot=_optional_float(row["inlet_mdot"]) if row["kind"] == "inlet" else None,
-                inlet_temperature=_optional_float(row["inlet_temperature"]) if row["kind"] == "inlet" else None,
-                inlet_pressure=_optional_float(row["inlet_pressure"]) if row["kind"] == "inlet" else None,
+                inlet_mdot=_optional_si(row, "inlet_mdot") if row["kind"] == "inlet" else None,
+                inlet_temperature=_optional_si(row, "inlet_temperature") if row["kind"] == "inlet" else None,
+                inlet_pressure=_optional_si(row, "inlet_pressure") if row["kind"] == "inlet" else None,
             )
             for row in self.node_rows
         ]
         edges: list[EdgeSpec] = []
         for row in self.edge_rows:
             geometry = Geometry(
-                length=_required_float(row["length"], f'{row["edge_id"]}.length'),
+                length=_required_si(row, "length", f'{row["edge_id"]}.length'),
                 shape=row["shape"],  # type: ignore[arg-type]
-                width=_optional_float(row["width"]),
-                height=_optional_float(row["height"]),
-                diameter=_optional_float(row["diameter"]),
+                width=_optional_si(row, "width"),
+                height=_optional_si(row, "height"),
+                diameter=_optional_si(row, "diameter"),
             )
             wall = WallBoundary(
                 mode=row["wall_mode"],  # type: ignore[arg-type]
-                wall_temperature=_optional_float(row["wall_temperature"]),
-                heat_flux=_optional_float(row["heat_flux"]),
-                external_htc=_optional_float(row["external_htc"]),
-                external_temperature=_optional_float(row["external_temperature"]),
-                wall_thickness=_optional_float(row["wall_thickness"]),
-                wall_conductivity=_optional_float(row["wall_conductivity"]),
-                tbc_thickness=_optional_float(row["tbc_thickness"]),
-                tbc_conductivity=_optional_float(row["tbc_conductivity"]),
+                wall_temperature=_optional_si(row, "wall_temperature"),
+                heat_flux=_optional_si(row, "heat_flux"),
+                external_htc=_optional_si(row, "external_htc"),
+                external_temperature=_optional_si(row, "external_temperature"),
+                wall_thickness=_optional_si(row, "wall_thickness"),
+                wall_conductivity=_optional_si(row, "wall_conductivity"),
+                tbc_thickness=_optional_si(row, "tbc_thickness"),
+                tbc_conductivity=_optional_si(row, "tbc_conductivity"),
             )
             edges.append(
                 EdgeSpec(
@@ -2905,6 +3182,18 @@ class PassageApp(tk.Tk):
             )
         if info.get("wall_mode") == "external_convection":
             rows.extend([
+                (
+                    "Coolant bulk T [K]",
+                    _fmt_number(
+                        float(
+                            info.get(
+                                "coolant_bulk_temperature_k",
+                                info["fluid_reference_temperature_k"],
+                            )
+                        ),
+                        2,
+                    ),
+                ),
                 ("External gas T [K]", _fmt_number(float(info["external_temperature_k"]), 2)),
                 ("TBC outer T [K]", _fmt_number(float(info["tbc_outer_temperature_k"]), 2)),
                 ("Metal outer T [K]", _fmt_number(float(info["metal_outer_temperature_k"]), 2)),
@@ -2959,7 +3248,15 @@ class PassageApp(tk.Tk):
             ("TBC outer", float(info["tbc_outer_temperature_k"])),
             ("Metal outer", float(info["metal_outer_temperature_k"])),
             ("Coolant wall", float(info["coolant_side_wall_temperature_k"])),
-            ("Coolant bulk", float(info["fluid_reference_temperature_k"])),
+            (
+                "Coolant bulk",
+                float(
+                    info.get(
+                        "coolant_bulk_temperature_k",
+                        info["fluid_reference_temperature_k"],
+                    )
+                ),
+            ),
         ]
         values = [temperature for _label, temperature in layers]
         margin = 16
@@ -3003,7 +3300,7 @@ class PassageApp(tk.Tk):
         total_flow = 0.0
         for row in inlet_rows:
             try:
-                value = _optional_float(row["inlet_mdot"])
+                value = _optional_si(row, "inlet_mdot")
             except ValueError:
                 value = None
             if value is not None:
@@ -3175,15 +3472,42 @@ class PassageApp(tk.Tk):
         return f"{prefix}{index}"
 
 
+def _unit_group_for_key(key: str | None) -> str | None:
+    if key is None:
+        return None
+    return FIELD_UNIT_GROUPS.get(key)
+
+
+def _unit_row_key(key: str) -> str:
+    return f"unit.{key}"
+
+
+def _default_unit_for_key(key: str) -> str:
+    unit_group = _unit_group_for_key(key)
+    if unit_group is None:
+        return ""
+    return UNIT_OPTIONS[unit_group][0]
+
+
+def _unit_defaults_for_keys(keys: tuple[str, ...]) -> dict[str, str]:
+    return {
+        _unit_row_key(key): _default_unit_for_key(key)
+        for key in keys
+        if _unit_group_for_key(key) is not None
+    }
+
+
 def _node_to_row(node: NodeSpec) -> dict[str, str]:
     is_inlet = node.kind == "inlet"
-    return {
+    row = {
         "node_id": node.node_id,
         "kind": node.kind,
         "inlet_mdot": _fmt_optional(node.inlet_mdot) if is_inlet else "",
         "inlet_temperature": _fmt_optional(node.inlet_temperature) if is_inlet else "",
         "inlet_pressure": _fmt_optional(node.inlet_pressure) if is_inlet else "",
     }
+    row.update(_unit_defaults_for_keys(NODE_UNIT_KEYS))
+    return row
 
 
 def _edge_to_row(edge: EdgeSpec) -> dict[str, str]:
@@ -3222,6 +3546,7 @@ def _edge_to_row(edge: EdgeSpec) -> dict[str, str]:
             "params_text": _format_params(additional_params),
         }
     )
+    row.update(_unit_defaults_for_keys(EDGE_UNIT_KEYS))
     return row
 
 
@@ -3242,7 +3567,12 @@ def _params_from_row(row: dict[str, str]) -> dict[str, Any]:
     for spec in TECH_PARAM_SPECS.get(technology, ()):
         value = row.get(_param_row_key(spec.key), "").strip()
         if value:
-            params[spec.key] = _parse_value(value)
+            unit_group = _unit_group_for_key(spec.key)
+            if unit_group is None:
+                params[spec.key] = _parse_value(value)
+            else:
+                unit = row.get(_unit_row_key(spec.key), _default_unit_for_key(spec.key))
+                params[spec.key] = _to_si(_required_float(value, spec.key), unit_group, unit)
     return params
 
 
@@ -3407,6 +3737,116 @@ def _required_float(value: str, name: str) -> float:
     if parsed is None:
         raise ValueError(f"{name} is required.")
     return parsed
+
+
+_UNIT_FACTORS_TO_SI = {
+    "length": {
+        "m": 1.0,
+        "cm": 1.0e-2,
+        "mm": 1.0e-3,
+        "um": 1.0e-6,
+        "in": 0.0254,
+        "ft": 0.3048,
+    },
+    "pressure": {
+        "Pa": 1.0,
+        "kPa": 1.0e3,
+        "MPa": 1.0e6,
+        "bar": 1.0e5,
+        "psi": 6_894.757293168,
+    },
+    "mass_flow": {
+        "kg/s": 1.0,
+        "g/s": 1.0e-3,
+        "kg/min": 1.0 / 60.0,
+        "g/min": 1.0e-3 / 60.0,
+        "lb/s": 0.45359237,
+        "lb/min": 0.45359237 / 60.0,
+    },
+    "thermal_conductivity": {
+        "W/m/K": 1.0,
+        "BTU/h/ft/F": 1.730735,
+    },
+    "heat_flux": {
+        "W/m2": 1.0,
+        "kW/m2": 1.0e3,
+        "MW/m2": 1.0e6,
+        "BTU/h/ft2": 3.15459075,
+    },
+    "htc": {
+        "W/m2/K": 1.0,
+        "kW/m2/K": 1.0e3,
+        "BTU/h/ft2/F": 5.67826334,
+    },
+}
+
+
+def _to_si(value: float, unit_group: str, unit: str) -> float:
+    if unit_group == "temperature":
+        return _temperature_to_kelvin(value, unit)
+    try:
+        return value * _UNIT_FACTORS_TO_SI[unit_group][unit]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported unit '{unit}' for {unit_group}.") from exc
+
+
+def _from_si(value: float, unit_group: str, unit: str) -> float:
+    if unit_group == "temperature":
+        return _kelvin_to_temperature(value, unit)
+    try:
+        return value / _UNIT_FACTORS_TO_SI[unit_group][unit]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported unit '{unit}' for {unit_group}.") from exc
+
+
+def _temperature_to_kelvin(value: float, unit: str) -> float:
+    if unit == "K":
+        return value
+    if unit == "C":
+        return value + 273.15
+    if unit == "F":
+        return (value - 32.0) * 5.0 / 9.0 + 273.15
+    if unit == "R":
+        return value * 5.0 / 9.0
+    raise ValueError(f"Unsupported temperature unit '{unit}'.")
+
+
+def _kelvin_to_temperature(value: float, unit: str) -> float:
+    if unit == "K":
+        return value
+    if unit == "C":
+        return value - 273.15
+    if unit == "F":
+        return (value - 273.15) * 9.0 / 5.0 + 32.0
+    if unit == "R":
+        return value * 9.0 / 5.0
+    raise ValueError(f"Unsupported temperature unit '{unit}'.")
+
+
+def _optional_si(row: dict[str, str], key: str) -> float | None:
+    value = _optional_float(row.get(key))
+    if value is None:
+        return None
+    unit_group = _unit_group_for_key(key)
+    if unit_group is None:
+        return value
+    unit = row.get(_unit_row_key(key), _default_unit_for_key(key))
+    return _to_si(value, unit_group, unit)
+
+
+def _required_si(row: dict[str, str], key: str, name: str) -> float:
+    value = _optional_si(row, key)
+    if value is None:
+        raise ValueError(f"{name} is required.")
+    return value
+
+
+def _fmt_row_si(row: dict[str, str], key: str) -> str:
+    try:
+        value = _optional_si(row, key)
+    except ValueError:
+        return row.get(key, "")
+    return _fmt_optional(value)
 
 
 def _fmt_optional(value: float | int | None) -> str:

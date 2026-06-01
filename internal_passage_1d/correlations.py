@@ -407,16 +407,13 @@ def _heat_rate(
     if wall.mode == "wall_temperature":
         if wall.wall_temperature is None:
             raise ValueError(f"{edge.edge_id}: wall_temperature is required.")
-        fluid_temperature = (
-            reference_temperature
-            if options.thermal_driving_temperature == "reference"
-            else inlet_temperature
-        )
+        fluid_temperature = inlet_temperature
         heat_rate = htc * area * (wall.wall_temperature - fluid_temperature)
         details.update(
             {
                 "thermal_area_m2": area,
                 "fluid_reference_temperature_k": fluid_temperature,
+                "coolant_bulk_temperature_k": fluid_temperature,
                 "coolant_side_wall_temperature_k": wall.wall_temperature,
                 "heat_flux_w_m2": heat_rate / area,
             }
@@ -492,11 +489,7 @@ def _external_convection_heat_rate(
         "tbc_conductivity",
         edge.edge_id,
     )
-    fluid_temperature = (
-        reference_temperature
-        if options.thermal_driving_temperature == "reference"
-        else inlet_temperature
-    )
+    fluid_temperature = inlet_temperature
 
     r_internal = 1.0 / (htc * area)
     r_wall = wall_thickness / (wall_conductivity * area) if wall_thickness else 0.0
@@ -512,6 +505,7 @@ def _external_convection_heat_rate(
         "wall_mode": "external_convection",
         "thermal_area_m2": area,
         "fluid_reference_temperature_k": fluid_temperature,
+        "coolant_bulk_temperature_k": fluid_temperature,
         "external_temperature_k": external_temperature,
         "external_htc_w_m2_k": external_htc,
         "wall_thickness_m": wall_thickness,

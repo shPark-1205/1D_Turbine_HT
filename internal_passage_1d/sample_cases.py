@@ -80,7 +80,7 @@ def build_default_network() -> NetworkSpec:
             "4_to_5",
             "4",
             "5",
-            Geometry(length=0.24, width=0.017, height=0.170),
+            Geometry(length=0.24, width=0.017, height=0.017),
             "rib",
             hot_wall,
             params={
