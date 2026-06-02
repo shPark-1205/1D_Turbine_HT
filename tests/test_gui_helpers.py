@@ -4,6 +4,7 @@ import unittest
 
 from internal_passage_1d.gui import (
     DEFAULT_NODE_POSITIONS,
+    TAG_OPTIONS,
     _auto_node_positions,
     _point_to_segment_distance,
     _edge_to_row,
@@ -46,6 +47,7 @@ class GuiHelperTest(unittest.TestCase):
         self.assertEqual(row[_param_row_key("p_over_e")], "11")
         self.assertEqual(row[_param_row_key("angle_deg")], "45")
         self.assertEqual(row["wall_mode"], "external_convection")
+        self.assertEqual(row["tag"], TAG_OPTIONS[0])
         self.assertEqual(row["external_temperature"], "1,150")
         self.assertEqual(row["tbc_conductivity"], "1.2")
         self.assertEqual(row["params_text"], "")

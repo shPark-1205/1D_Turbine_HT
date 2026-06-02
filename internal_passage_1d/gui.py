@@ -45,6 +45,32 @@ TECHNOLOGIES = ("smooth", "rib", "turning", "pin_fin")
 SHAPES = ("rectangular", "circular")
 WALL_MODES = ("adiabatic", "wall_temperature", "heat_flux", "external_convection")
 PROPERTY_MODELS = ("ideal_gas", "coolprop")
+TAG_OPTIONS = ("Unassigned", "Leading edge", "Trailing edge")
+BATCH_TARGET_MODES = (
+    "All edges",
+    "Current edge",
+    "Layout selected edges",
+    "Cooling technology",
+    "Tag",
+)
+BATCH_BASE_FIELDS = (
+    ("tag", "Tag", "choice", TAG_OPTIONS),
+    ("cooling_technology", "Cooling technology", "choice", TECHNOLOGIES),
+    ("shape", "Shape", "choice", SHAPES),
+    ("wall_mode", "Wall mode", "choice", WALL_MODES),
+    ("length", "Length", "number", ()),
+    ("width", "Width", "number", ()),
+    ("height", "Height", "number", ()),
+    ("diameter", "Diameter", "number", ()),
+    ("wall_temperature", "Wall T", "number", ()),
+    ("heat_flux", "Heat flux", "number", ()),
+    ("external_temperature", "External gas T", "number", ()),
+    ("external_htc", "External h", "number", ()),
+    ("wall_thickness", "Blade wall thickness", "number", ()),
+    ("wall_conductivity", "Blade wall k", "number", ()),
+    ("tbc_thickness", "TBC thickness", "number", ()),
+    ("tbc_conductivity", "TBC k", "number", ()),
+)
 SWEEP_MAX_VARIABLES = 3
 SWEEP_OBJECTIVE_SCOPES = ("Global", "Node", "Edge")
 SWEEP_DIRECTIONS = ("Minimize", "Maximize")
@@ -211,6 +237,24 @@ EDGE_FIELD_UNIT_KEYS = (
 EDGE_UNIT_KEYS = EDGE_FIELD_UNIT_KEYS + tuple(
     key for key in ALL_PARAM_KEYS if key in FIELD_UNIT_GROUPS
 )
+BATCH_FIELD_SPECS = BATCH_BASE_FIELDS + tuple(
+    (
+        spec.key,
+        f"{technology.replace('_', ' ').title()} / {spec.label}",
+        "number",
+        (),
+    )
+    for technology, specs in TECH_PARAM_SPECS.items()
+    for spec in specs
+)
+BATCH_FIELD_LABELS = {
+    key: label for key, label, _kind, _choices in BATCH_FIELD_SPECS
+}
+BATCH_FIELD_OPTIONS = tuple(label for _key, label, _kind, _choices in BATCH_FIELD_SPECS)
+BATCH_FIELD_BY_LABEL = {
+    label: (key, kind, choices)
+    for key, label, kind, choices in BATCH_FIELD_SPECS
+}
 
 
 class PassageApp(tk.Tk):
@@ -236,6 +280,7 @@ class PassageApp(tk.Tk):
         self._layout_image_bbox = (20.0, 20.0, 1.0, 1.0)
         self.selected_node_id: str | None = None
         self.selected_edge_id: str | None = None
+        self.selected_layout_edge_ids: set[str] = set()
         self._layout_mode = tk.StringVar(value="select")
         self._pending_edge_from: str | None = None
         self._drag_node_id: str | None = None
@@ -254,6 +299,7 @@ class PassageApp(tk.Tk):
         self._selected_sweep_variable_id: str | None = None
         self._sweep_cancel_requested = False
         self._sweep_plot_canvas: Any = None
+        self._last_batch_snapshot: tuple[list[dict[str, str]], list[dict[str, str]]] | None = None
 
         self.property_model = tk.StringVar(value="ideal_gas")
         self.overlay_metric = tk.StringVar(value="Technology")
@@ -270,6 +316,13 @@ class PassageApp(tk.Tk):
         self.sweep_plot_type = tk.StringVar(value="Auto")
         self.sweep_plot_x = tk.StringVar()
         self.sweep_plot_y = tk.StringVar()
+        self.batch_target_mode = tk.StringVar(value="All edges")
+        self.batch_target_technology = tk.StringVar(value=TECHNOLOGIES[0])
+        self.batch_target_tag = tk.StringVar(value=TAG_OPTIONS[0])
+        self.batch_field = tk.StringVar(value=BATCH_FIELD_OPTIONS[0])
+        self.batch_value = tk.StringVar()
+        self.batch_unit = tk.StringVar()
+        self.batch_choice_value = tk.StringVar()
         self._constraint_enabled = {
             key: tk.BooleanVar(value=False) for key in CONSTRAINT_SPECS
         }
@@ -295,6 +348,7 @@ class PassageApp(tk.Tk):
         self._node_vars = {
             "node_id": tk.StringVar(),
             "kind": tk.StringVar(value="internal"),
+            "tag": tk.StringVar(value=TAG_OPTIONS[0]),
             "inlet_mdot": tk.StringVar(),
             "inlet_temperature": tk.StringVar(),
             "inlet_pressure": tk.StringVar(),
@@ -303,6 +357,7 @@ class PassageApp(tk.Tk):
             "edge_id": tk.StringVar(),
             "from_node": tk.StringVar(),
             "to_node": tk.StringVar(),
+            "tag": tk.StringVar(value=TAG_OPTIONS[0]),
             "cooling_technology": tk.StringVar(value="smooth"),
             "shape": tk.StringVar(value="rectangular"),
             "length": tk.StringVar(),
@@ -627,6 +682,7 @@ class PassageApp(tk.Tk):
         self._build_workspace_summary(right)
         self._build_workspace_node_editor(right)
         self._build_workspace_edge_editor(right)
+        self._build_batch_apply_panel(right)
         self._build_selected_result_panel(right)
         self._build_workspace_tables(right)
 
@@ -1077,10 +1133,18 @@ class PassageApp(tk.Tk):
         )
         node_kind_combo.grid(row=2, column=1, sticky=tk.EW, pady=3)
         self._bind_combobox_mousewheel(node_kind_combo)
+        self._labeled_combo(
+            node_panel,
+            3,
+            "Tag",
+            self._node_vars["tag"],
+            TAG_OPTIONS,
+            form="node",
+        )
         self.node_inlet_fields = []
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
-            3,
+            4,
             "Inlet m_dot",
             self._node_vars["inlet_mdot"],
             form="node",
@@ -1089,7 +1153,7 @@ class PassageApp(tk.Tk):
         ))
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
-            4,
+            5,
             "Inlet temperature",
             self._node_vars["inlet_temperature"],
             form="node",
@@ -1098,7 +1162,7 @@ class PassageApp(tk.Tk):
         ))
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
-            5,
+            6,
             "Inlet pressure",
             self._node_vars["inlet_pressure"],
             form="node",
@@ -1108,7 +1172,7 @@ class PassageApp(tk.Tk):
         node_panel.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(node_panel, style="Panel.TFrame")
-        buttons.grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+        buttons.grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
         ttk.Button(buttons, text="Add Node", command=self.add_node).pack(
             side=tk.LEFT
         )
@@ -1150,6 +1214,15 @@ class PassageApp(tk.Tk):
             form="edge",
         )
         self.edge_to_combo = edge_panel.grid_slaves(row=row, column=1)[0]
+        row += 1
+        self._labeled_combo(
+            edge_panel,
+            row,
+            "Tag",
+            self._edge_vars["tag"],
+            TAG_OPTIONS,
+            form="edge",
+        )
         row += 1
         self._labeled_combo(
             edge_panel,
@@ -1232,6 +1305,100 @@ class PassageApp(tk.Tk):
             side=tk.LEFT, padx=6
         )
 
+    def _build_batch_apply_panel(self, parent: ttk.Frame) -> None:
+        batch_panel = self._panel(parent)
+        self.batch_panel = batch_panel
+        batch_panel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(batch_panel, text="Batch Apply", style="Section.TLabel").grid(
+            row=0,
+            column=0,
+            columnspan=3,
+            sticky=tk.W,
+            pady=(0, 8),
+        )
+        ttk.Label(
+            batch_panel,
+            text="Ctrl+click edges on the layout to build a batch selection.",
+            style="Header.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(0, 6))
+
+        self._labeled_combo(
+            batch_panel,
+            2,
+            "Target",
+            self.batch_target_mode,
+            BATCH_TARGET_MODES,
+        )
+        self._labeled_combo(
+            batch_panel,
+            3,
+            "Technology",
+            self.batch_target_technology,
+            TECHNOLOGIES,
+        )
+        self.batch_target_technology_widgets = batch_panel.grid_slaves(row=3)
+        self._labeled_combo(
+            batch_panel,
+            4,
+            "Tag",
+            self.batch_target_tag,
+            TAG_OPTIONS,
+        )
+        self.batch_target_tag_widgets = batch_panel.grid_slaves(row=4)
+        self._labeled_combo(
+            batch_panel,
+            5,
+            "Field",
+            self.batch_field,
+            BATCH_FIELD_OPTIONS,
+        )
+        self.batch_value_widgets: list[tk.Widget] = []
+        self.batch_value_row = 6
+        self._render_batch_value_widgets()
+        buttons = ttk.Frame(batch_panel, style="Panel.TFrame")
+        buttons.grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
+        ttk.Button(
+            buttons,
+            text="Apply Batch",
+            command=self.apply_batch_edit,
+            style="Accent.TButton",
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            buttons,
+            text="Undo Batch",
+            command=self.undo_batch_edit,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self.batch_status_label = ttk.Label(
+            batch_panel,
+            text="Target edges: 0",
+            style="Header.TLabel",
+        )
+        self.batch_status_label.grid(
+            row=8,
+            column=0,
+            columnspan=3,
+            sticky=tk.W,
+            pady=(8, 0),
+        )
+        batch_panel.columnconfigure(1, weight=1)
+        self.batch_target_mode.trace_add(
+            "write",
+            lambda *_args: self._update_batch_target_visibility(),
+        )
+        self.batch_target_technology.trace_add(
+            "write",
+            lambda *_args: self._update_batch_status(),
+        )
+        self.batch_target_tag.trace_add(
+            "write",
+            lambda *_args: self._update_batch_status(),
+        )
+        self.batch_field.trace_add(
+            "write",
+            lambda *_args: self._render_batch_value_widgets(),
+        )
+        self._update_batch_target_visibility()
+
     def _build_selected_result_panel(self, parent: ttk.Frame) -> None:
         result_panel = self._panel(parent)
         result_panel.pack(fill=tk.X, pady=(0, 8))
@@ -1278,7 +1445,7 @@ class PassageApp(tk.Tk):
             anchor=tk.W,
             pady=(0, 4),
         )
-        node_columns = ("node_id", "kind", "mdot", "temperature", "pressure")
+        node_columns = ("node_id", "kind", "tag", "mdot", "temperature", "pressure")
         self.node_tree = ttk.Treeview(
             table_panel,
             columns=node_columns,
@@ -1288,6 +1455,7 @@ class PassageApp(tk.Tk):
         node_headings = {
             "node_id": "Node",
             "kind": "Kind",
+            "tag": "Tag",
             "mdot": "m_dot [kg/s]",
             "temperature": "T [K]",
             "pressure": "P [Pa]",
@@ -1302,7 +1470,7 @@ class PassageApp(tk.Tk):
             anchor=tk.W,
             pady=(10, 4),
         )
-        edge_columns = ("edge_id", "route", "tech", "length")
+        edge_columns = ("edge_id", "route", "tech", "tag", "length")
         self.edge_tree = ttk.Treeview(
             table_panel,
             columns=edge_columns,
@@ -1313,6 +1481,7 @@ class PassageApp(tk.Tk):
             "edge_id": "Edge",
             "route": "Route",
             "tech": "Tech",
+            "tag": "Tag",
             "length": "L [m]",
         }
         for column in edge_columns:
@@ -1818,18 +1987,21 @@ class PassageApp(tk.Tk):
                 continue
             x1, y1 = self._layout_to_canvas(from_pos)
             x2, y2 = self._layout_to_canvas(to_pos)
-            is_selected = row["edge_id"] == self.selected_edge_id
+            is_current = row["edge_id"] == self.selected_edge_id
+            is_batch_selected = row["edge_id"] in self.selected_layout_edge_ids
+            is_selected = is_current or is_batch_selected
             overlay_value = metric_values.get(row["edge_id"])
             color = ACCENT_COLOR
             if overlay_value is not None:
                 color = _value_to_color(overlay_value, list(metric_values.values()))
+            selected_color = WARNING_COLOR if is_current else SAFE_COLOR
             canvas.create_line(
                 x1,
                 y1,
                 x2,
                 y2,
-                fill=WARNING_COLOR if is_selected else color,
-                width=7 if overlay_value is not None else (5 if is_selected else 3),
+                fill=selected_color if is_selected else color,
+                width=7 if is_selected or overlay_value is not None else 3,
                 arrow=tk.LAST,
                 arrowshape=(14, 16, 6),
             )
@@ -1839,7 +2011,7 @@ class PassageApp(tk.Tk):
             label_fill = "#ffffff"
             label_text = TEXT_COLOR
             if overlay_value is not None:
-                label_fill = WARNING_COLOR if is_selected else color
+                label_fill = selected_color if is_selected else color
                 label_text = _contrast_text_color(label_fill)
             label_half_width = max(34, 4.4 * len(label) + 8)
             canvas.create_rectangle(
@@ -1848,7 +2020,7 @@ class PassageApp(tk.Tk):
                 mid_x + label_half_width,
                 mid_y + 13,
                 fill="#fff8e8" if is_selected and overlay_value is None else label_fill,
-                outline=WARNING_COLOR if is_selected else BORDER_COLOR,
+                outline=selected_color if is_selected else BORDER_COLOR,
             )
             canvas.create_text(
                 mid_x,
@@ -2006,12 +2178,38 @@ class PassageApp(tk.Tk):
 
         edge_id = self._edge_at_canvas(event.x, event.y)
         if edge_id is not None:
+            if _event_has_control(event):
+                self._toggle_layout_edge_selection(edge_id)
+                return
             self._select_edge_by_id(edge_id)
             return
 
         self.selected_node_id = None
         self.selected_edge_id = None
+        self.selected_layout_edge_ids.clear()
         self._update_selected_result_panel()
+        self._update_batch_status()
+        self._redraw_layout_canvas()
+
+    def _toggle_layout_edge_selection(self, edge_id: str) -> None:
+        if edge_id in self.selected_layout_edge_ids:
+            self.selected_layout_edge_ids.remove(edge_id)
+        else:
+            self.selected_layout_edge_ids.add(edge_id)
+        self.selected_edge_id = edge_id
+        self.selected_node_id = None
+        index = self._edge_index(edge_id)
+        if index is not None:
+            self.edge_tree.selection_set(str(index))
+            self.edge_tree.focus(str(index))
+            self._populate_edge_form(index)
+        if hasattr(self, "node_tree"):
+            self.node_tree.selection_remove(self.node_tree.selection())
+        self._update_selected_result_panel()
+        self._update_layout_status(
+            f"Ctrl-selected edges: {len(self.selected_layout_edge_ids)}"
+        )
+        self._update_batch_status()
         self._redraw_layout_canvas()
 
     def _on_layout_drag(self, event: tk.Event) -> None:
@@ -2067,12 +2265,14 @@ class PassageApp(tk.Tk):
             return
         self.selected_node_id = node_id
         self.selected_edge_id = None
+        self.selected_layout_edge_ids.clear()
         self.node_tree.selection_set(str(index))
         self.node_tree.focus(str(index))
         self._populate_node_form(index)
         if hasattr(self, "edge_tree"):
             self.edge_tree.selection_remove(self.edge_tree.selection())
         self._update_selected_result_panel()
+        self._update_batch_status()
         self._redraw_layout_canvas()
 
     def _select_edge_by_id(self, edge_id: str) -> None:
@@ -2081,12 +2281,14 @@ class PassageApp(tk.Tk):
             return
         self.selected_edge_id = edge_id
         self.selected_node_id = None
+        self.selected_layout_edge_ids.clear()
         self.edge_tree.selection_set(str(index))
         self.edge_tree.focus(str(index))
         self._populate_edge_form(index)
         if hasattr(self, "node_tree"):
             self.node_tree.selection_remove(self.node_tree.selection())
         self._update_selected_result_panel()
+        self._update_batch_status()
         self._redraw_layout_canvas()
 
     def _node_index(self, node_id: str) -> int | None:
@@ -2107,6 +2309,7 @@ class PassageApp(tk.Tk):
             {
                 "node_id": node_id,
                 "kind": "internal",
+                "tag": TAG_OPTIONS[0],
                 "inlet_mdot": "",
                 "inlet_temperature": "",
                 "inlet_pressure": "",
@@ -2154,6 +2357,7 @@ class PassageApp(tk.Tk):
             "edge_id": edge_id,
             "from_node": from_node,
             "to_node": to_node,
+            "tag": TAG_OPTIONS[0],
             "cooling_technology": "smooth",
             "shape": "rectangular",
             "length": "0.1",
@@ -2874,6 +3078,221 @@ class PassageApp(tk.Tk):
             command=lambda form=form, key=field_key: self._toggle_sweep_variable(form, key),
         ).grid(row=0, column=column, sticky=tk.E, padx=(8, 0))
 
+    def _render_batch_value_widgets(self) -> None:
+        if not hasattr(self, "batch_value_row"):
+            return
+        for widget in getattr(self, "batch_value_widgets", []):
+            widget.destroy()
+        self.batch_value_widgets = []
+        field_key, field_kind, field_choices = self._batch_field_spec()
+        label = ttk.Label(self._batch_panel_parent(), text="Value")
+        label.grid(row=self.batch_value_row, column=0, sticky=tk.W, pady=3)
+        self.batch_value_widgets.append(label)
+        if field_kind == "choice":
+            if not self.batch_choice_value.get() or self.batch_choice_value.get() not in field_choices:
+                self.batch_choice_value.set(field_choices[0] if field_choices else "")
+            combo = ttk.Combobox(
+                self._batch_panel_parent(),
+                textvariable=self.batch_choice_value,
+                values=field_choices,
+                state="readonly",
+                width=20,
+            )
+            combo.grid(row=self.batch_value_row, column=1, sticky=tk.EW, pady=3)
+            self._bind_combobox_mousewheel(combo)
+            self.batch_value_widgets.append(combo)
+        else:
+            value_frame = ttk.Frame(self._batch_panel_parent())
+            value_frame.grid(row=self.batch_value_row, column=1, sticky=tk.EW, pady=3)
+            value_frame.columnconfigure(0, weight=1)
+            entry = ttk.Entry(value_frame, textvariable=self.batch_value)
+            entry.grid(row=0, column=0, sticky=tk.EW)
+            unit_group = _unit_group_for_key(field_key)
+            if unit_group is not None:
+                if self.batch_unit.get() not in UNIT_OPTIONS[unit_group]:
+                    self.batch_unit.set(UNIT_OPTIONS[unit_group][0])
+                unit_combo = ttk.Combobox(
+                    value_frame,
+                    textvariable=self.batch_unit,
+                    values=UNIT_OPTIONS[unit_group],
+                    state="readonly",
+                    width=13,
+                )
+                unit_combo.grid(row=0, column=1, sticky=tk.E, padx=(6, 0))
+                self._bind_combobox_mousewheel(unit_combo)
+            else:
+                self.batch_unit.set("")
+            self.batch_value_widgets.append(value_frame)
+        self._update_batch_status()
+
+    def _batch_panel_parent(self) -> tk.Widget:
+        return self.batch_panel if hasattr(self, "batch_panel") else self
+
+    def _batch_field_spec(self) -> tuple[str, str, tuple[str, ...]]:
+        return BATCH_FIELD_BY_LABEL.get(
+            self.batch_field.get(),
+            BATCH_FIELD_BY_LABEL[BATCH_FIELD_OPTIONS[0]],
+        )
+
+    def _update_batch_target_visibility(self) -> None:
+        if not hasattr(self, "batch_target_technology_widgets"):
+            return
+        mode = self.batch_target_mode.get()
+        for widget in self.batch_target_technology_widgets:
+            if mode == "Cooling technology":
+                widget.grid()
+            else:
+                widget.grid_remove()
+        for widget in self.batch_target_tag_widgets:
+            if mode == "Tag":
+                widget.grid()
+            else:
+                widget.grid_remove()
+        self._update_batch_status()
+
+    def _update_batch_status(self) -> None:
+        if not hasattr(self, "batch_status_label"):
+            return
+        edge_ids = self._batch_target_edge_ids()
+        self.batch_status_label.configure(
+            text=(
+                f"Target edges: {len(edge_ids)}"
+                f" | Ctrl-selected: {len(self.selected_layout_edge_ids)}"
+            )
+        )
+
+    def _batch_target_edge_ids(self) -> list[str]:
+        mode = self.batch_target_mode.get()
+        if mode == "Current edge":
+            return [self.selected_edge_id] if self.selected_edge_id else []
+        if mode == "Layout selected edges":
+            valid_ids = {row["edge_id"] for row in self.edge_rows}
+            return [
+                edge_id
+                for edge_id in self.selected_layout_edge_ids
+                if edge_id in valid_ids
+            ]
+        if mode == "Cooling technology":
+            technology = _normalize_technology(self.batch_target_technology.get())
+            return [
+                row["edge_id"]
+                for row in self.edge_rows
+                if _normalize_technology(row["cooling_technology"]) == technology
+            ]
+        if mode == "Tag":
+            tag = self.batch_target_tag.get()
+            return [
+                row["edge_id"]
+                for row in self.edge_rows
+                if row.get("tag", TAG_OPTIONS[0]) == tag
+            ]
+        return [row["edge_id"] for row in self.edge_rows]
+
+    def apply_batch_edit(self) -> None:
+        edge_ids = set(self._batch_target_edge_ids())
+        if not edge_ids:
+            messagebox.showwarning("No target edges", "No edges match the selected batch target.")
+            return
+        field_key, field_kind, _field_choices = self._batch_field_spec()
+        try:
+            value = self._batch_value_for_rows(field_key, field_kind)
+        except ValueError as exc:
+            messagebox.showerror("Invalid batch value", str(exc))
+            return
+
+        self._last_batch_snapshot = (deepcopy(self.node_rows), deepcopy(self.edge_rows))
+        changed = 0
+        for row in self.edge_rows:
+            if row["edge_id"] not in edge_ids:
+                continue
+            self._apply_batch_value_to_row(row, field_key, field_kind, value)
+            changed += 1
+        self._refresh_after_batch_edit()
+        self.batch_status_label.configure(text=f"Applied to {changed} edge(s).")
+
+    def _batch_value_for_rows(self, field_key: str, field_kind: str) -> Any:
+        if field_kind == "choice":
+            value = self.batch_choice_value.get().strip()
+            if not value:
+                raise ValueError("Select a value to apply.")
+            return value
+        raw_value = self.batch_value.get().strip()
+        if not raw_value:
+            raise ValueError("Enter a value to apply.")
+        parsed = _required_float(raw_value, BATCH_FIELD_LABELS.get(field_key, field_key))
+        unit_group = _unit_group_for_key(field_key)
+        if unit_group is None:
+            return parsed
+        unit = self.batch_unit.get()
+        return _to_si(parsed, unit_group, unit)
+
+    def _apply_batch_value_to_row(
+        self,
+        row: dict[str, str],
+        field_key: str,
+        field_kind: str,
+        value: Any,
+    ) -> None:
+        if field_key in ALL_PARAM_KEYS:
+            row_key = _param_row_key(field_key)
+        else:
+            row_key = field_key
+        if field_kind == "choice":
+            row[row_key] = str(value)
+            if field_key == "cooling_technology":
+                row["cooling_technology"] = _normalize_technology(row["cooling_technology"])
+                self._apply_batch_param_defaults(row)
+            return
+        unit_group = _unit_group_for_key(field_key)
+        if unit_group is None:
+            row[row_key] = _fmt_optional(value)
+            return
+        row_unit = row.get(_unit_row_key(field_key), _default_unit_for_key(field_key))
+        row[row_key] = _fmt_optional(_from_si(float(value), unit_group, row_unit))
+
+    def _apply_batch_param_defaults(self, row: dict[str, str]) -> None:
+        technology = _normalize_technology(row["cooling_technology"])
+        for spec in TECH_PARAM_SPECS.get(technology, ()):
+            row_key = _param_row_key(spec.key)
+            if not row.get(row_key, "").strip() and spec.default:
+                row[row_key] = spec.default
+
+    def _refresh_after_batch_edit(self) -> None:
+        self._refresh_node_tree()
+        self._refresh_edge_tree()
+        self._refresh_node_combos()
+        self._update_dashboard_summary()
+        self._sync_sweep_checkboxes()
+        self._refresh_sweep_variable_tree()
+        if self.selected_edge_id:
+            index = self._edge_index(self.selected_edge_id)
+            if index is not None:
+                self.edge_tree.selection_set(str(index))
+                self.edge_tree.focus(str(index))
+                self._populate_edge_form(index)
+        if self.selected_node_id:
+            index = self._node_index(self.selected_node_id)
+            if index is not None:
+                self.node_tree.selection_set(str(index))
+                self.node_tree.focus(str(index))
+                self._populate_node_form(index)
+        self._update_selected_result_panel()
+        self._after_apply()
+
+    def undo_batch_edit(self) -> None:
+        if self._last_batch_snapshot is None:
+            messagebox.showinfo("No undo", "There is no batch edit to undo.")
+            return
+        self.node_rows, self.edge_rows = deepcopy(self._last_batch_snapshot)
+        self._last_batch_snapshot = None
+        self.selected_layout_edge_ids = {
+            edge_id
+            for edge_id in self.selected_layout_edge_ids
+            if self._edge_index(edge_id) is not None
+        }
+        self._refresh_after_batch_edit()
+        self.batch_status_label.configure(text="Last batch edit was undone.")
+
     def _on_technology_change(self, *_args: object) -> None:
         if self._syncing_edge_form:
             return
@@ -3349,30 +3768,61 @@ class PassageApp(tk.Tk):
 
     def _refresh_node_tree(self) -> None:
         self.node_tree.delete(*self.node_tree.get_children())
+        columns = tuple(self.node_tree["columns"])
         for index, row in enumerate(self.node_rows):
-            self.node_tree.insert(
-                "",
-                tk.END,
-                iid=str(index),
-                values=(
+            if "tag" in columns:
+                values = (
+                    row["node_id"],
+                    row["kind"],
+                    row.get("tag", TAG_OPTIONS[0]),
+                    _fmt_row_si(row, "inlet_mdot"),
+                    _fmt_row_si(row, "inlet_temperature"),
+                    _fmt_row_si(row, "inlet_pressure"),
+                )
+            else:
+                values = (
                     row["node_id"],
                     row["kind"],
                     _fmt_row_si(row, "inlet_mdot"),
                     _fmt_row_si(row, "inlet_temperature"),
                     _fmt_row_si(row, "inlet_pressure"),
-                ),
+                )
+            self.node_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=values,
             )
 
     def _refresh_edge_tree(self) -> None:
         self.edge_tree.delete(*self.edge_tree.get_children())
         columns = tuple(self.edge_tree["columns"])
         for index, row in enumerate(self.edge_rows):
-            if columns == ("edge_id", "route", "tech", "length"):
+            if columns == ("edge_id", "route", "tech", "tag", "length"):
+                values = (
+                    row["edge_id"],
+                    f'{row["from_node"]} -> {row["to_node"]}',
+                    row["cooling_technology"],
+                    row.get("tag", TAG_OPTIONS[0]),
+                    _fmt_row_si(row, "length"),
+                )
+            elif columns == ("edge_id", "route", "tech", "length"):
                 values = (
                     row["edge_id"],
                     f'{row["from_node"]} -> {row["to_node"]}',
                     row["cooling_technology"],
                     _fmt_row_si(row, "length"),
+                )
+            elif "tag" in columns:
+                values = (
+                    row["edge_id"],
+                    f'{row["from_node"]} -> {row["to_node"]}',
+                    row["cooling_technology"],
+                    row.get("tag", TAG_OPTIONS[0]),
+                    _fmt_row_si(row, "length"),
+                    _fmt_row_si(row, "width"),
+                    _fmt_row_si(row, "height"),
+                    _fmt_row_si(row, "diameter"),
                 )
             else:
                 values = (
@@ -4071,17 +4521,23 @@ class PassageApp(tk.Tk):
         if index is not None:
             self.selected_node_id = self.node_rows[index]["node_id"]
             self.selected_edge_id = None
+            self.selected_layout_edge_ids.clear()
             self._populate_node_form(index)
             self._update_selected_result_panel()
+            self._update_batch_status()
             self._redraw_layout_canvas()
 
     def _on_edge_select(self, _event: tk.Event) -> None:
         index = self._selected_index(self.edge_tree)
         if index is not None:
-            self.selected_edge_id = self.edge_rows[index]["edge_id"]
+            edge_id = self.edge_rows[index]["edge_id"]
+            self.selected_edge_id = edge_id
             self.selected_node_id = None
+            if edge_id not in self.selected_layout_edge_ids:
+                self.selected_layout_edge_ids.clear()
             self._populate_edge_form(index)
             self._update_selected_result_panel()
+            self._update_batch_status()
             self._redraw_layout_canvas()
 
     def _populate_node_form(self, index: int) -> None:
@@ -4090,7 +4546,7 @@ class PassageApp(tk.Tk):
         try:
             self._set_unit_vars_from_row(row, NODE_UNIT_KEYS)
             for key, variable in self._node_vars.items():
-                variable.set(row[key])
+                variable.set(row.get(key, TAG_OPTIONS[0] if key == "tag" else ""))
         finally:
             self._suppress_auto_apply = False
         self._update_node_field_visibility()
@@ -4103,7 +4559,7 @@ class PassageApp(tk.Tk):
         try:
             self._set_unit_vars_from_row(row, EDGE_UNIT_KEYS)
             for key, variable in self._edge_vars.items():
-                variable.set(row[key])
+                variable.set(row.get(key, TAG_OPTIONS[0] if key == "tag" else ""))
             for key, variable in self._tech_param_vars.items():
                 variable.set(row.get(_param_row_key(key), ""))
         finally:
@@ -4158,6 +4614,7 @@ class PassageApp(tk.Tk):
             {
                 "node_id": node_id,
                 "kind": "internal",
+                "tag": TAG_OPTIONS[0],
                 "inlet_mdot": "",
                 "inlet_temperature": "",
                 "inlet_pressure": "",
@@ -4186,6 +4643,8 @@ class PassageApp(tk.Tk):
             for edge in self.edge_rows
             if edge["from_node"] != node_id and edge["to_node"] != node_id
         ]
+        valid_edge_ids = {edge["edge_id"] for edge in self.edge_rows}
+        self.selected_layout_edge_ids.intersection_update(valid_edge_ids)
         self.node_positions.pop(node_id, None)
         self.selected_node_id = None
         self.selected_edge_id = None
@@ -4195,6 +4654,7 @@ class PassageApp(tk.Tk):
         self._refresh_node_combos()
         self._update_dashboard_summary()
         self._update_selected_result_panel()
+        self._update_batch_status()
         self._redraw_layout_canvas()
         self._after_apply()
 
@@ -4250,9 +4710,12 @@ class PassageApp(tk.Tk):
             return
         del self.edge_rows[index]
         self.selected_edge_id = None
+        valid_edge_ids = {edge["edge_id"] for edge in self.edge_rows}
+        self.selected_layout_edge_ids.intersection_update(valid_edge_ids)
         self._refresh_edge_tree()
         self._update_dashboard_summary()
         self._update_selected_result_panel()
+        self._update_batch_status()
         self._after_apply()
 
     def _edge_form_to_row(self) -> dict[str, str]:
@@ -4828,6 +5291,7 @@ def _node_to_row(node: NodeSpec) -> dict[str, str]:
     row = {
         "node_id": node.node_id,
         "kind": node.kind,
+        "tag": TAG_OPTIONS[0],
         "inlet_mdot": _fmt_optional(node.inlet_mdot) if is_inlet else "",
         "inlet_temperature": _fmt_optional(node.inlet_temperature) if is_inlet else "",
         "inlet_pressure": _fmt_optional(node.inlet_pressure) if is_inlet else "",
@@ -4852,6 +5316,7 @@ def _edge_to_row(edge: EdgeSpec) -> dict[str, str]:
             "edge_id": edge.edge_id,
             "from_node": edge.from_node,
             "to_node": edge.to_node,
+            "tag": TAG_OPTIONS[0],
             "cooling_technology": technology,
             "shape": geometry.shape,
             "length": _fmt_optional(geometry.length),
@@ -5012,6 +5477,10 @@ def _unique_id(base_id: str, existing_ids: set[str]) -> str:
     while f"{base_id}_{index}" in existing_ids:
         index += 1
     return f"{base_id}_{index}"
+
+
+def _event_has_control(event: tk.Event) -> bool:
+    return bool(getattr(event, "state", 0) & 0x0004)
 
 
 def _format_params(params: dict[str, Any]) -> str:
