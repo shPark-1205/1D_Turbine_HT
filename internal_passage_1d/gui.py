@@ -71,7 +71,6 @@ BATCH_BASE_FIELDS = (
     ("tbc_thickness", "TBC thickness", "number", ()),
     ("tbc_conductivity", "TBC k", "number", ()),
 )
-SWEEP_MAX_VARIABLES = 3
 SWEEP_OBJECTIVE_SCOPES = ("Global", "Node", "Edge")
 SWEEP_DIRECTIONS = ("Minimize", "Maximize")
 GLOBAL_OBJECTIVE_METRICS = ("total_dp", "outlet_T", "max_wall_T")
@@ -247,15 +246,6 @@ BATCH_FIELD_SPECS = BATCH_BASE_FIELDS + tuple(
     for technology, specs in TECH_PARAM_SPECS.items()
     for spec in specs
 )
-BATCH_FIELD_LABELS = {
-    key: label for key, label, _kind, _choices in BATCH_FIELD_SPECS
-}
-BATCH_FIELD_OPTIONS = tuple(label for _key, label, _kind, _choices in BATCH_FIELD_SPECS)
-BATCH_FIELD_BY_LABEL = {
-    label: (key, kind, choices)
-    for key, label, kind, choices in BATCH_FIELD_SPECS
-}
-
 
 class PassageApp(tk.Tk):
     """Desktop GUI for editing and running the 1D passage solver."""
@@ -278,6 +268,7 @@ class PassageApp(tk.Tk):
         self._layout_native_photo: tk.PhotoImage | None = None
         self._layout_photo: Any = None
         self._layout_image_bbox = (20.0, 20.0, 1.0, 1.0)
+        self._edge_label_bboxes: dict[str, tuple[float, float, float, float]] = {}
         self.selected_node_id: str | None = None
         self.selected_edge_id: str | None = None
         self.selected_layout_edge_ids: set[str] = set()
@@ -299,6 +290,8 @@ class PassageApp(tk.Tk):
         self._selected_sweep_variable_id: str | None = None
         self._sweep_cancel_requested = False
         self._sweep_plot_canvas: Any = None
+        self.batch_field_keys: set[str] = set()
+        self._batch_checkbox_vars: dict[str, tk.BooleanVar] = {}
         self._last_batch_snapshot: tuple[list[dict[str, str]], list[dict[str, str]]] | None = None
 
         self.property_model = tk.StringVar(value="ideal_gas")
@@ -319,10 +312,6 @@ class PassageApp(tk.Tk):
         self.batch_target_mode = tk.StringVar(value="All edges")
         self.batch_target_technology = tk.StringVar(value=TECHNOLOGIES[0])
         self.batch_target_tag = tk.StringVar(value=TAG_OPTIONS[0])
-        self.batch_field = tk.StringVar(value=BATCH_FIELD_OPTIONS[0])
-        self.batch_value = tk.StringVar()
-        self.batch_unit = tk.StringVar()
-        self.batch_choice_value = tk.StringVar()
         self._constraint_enabled = {
             key: tk.BooleanVar(value=False) for key in CONSTRAINT_SPECS
         }
@@ -348,7 +337,6 @@ class PassageApp(tk.Tk):
         self._node_vars = {
             "node_id": tk.StringVar(),
             "kind": tk.StringVar(value="internal"),
-            "tag": tk.StringVar(value=TAG_OPTIONS[0]),
             "inlet_mdot": tk.StringVar(),
             "inlet_temperature": tk.StringVar(),
             "inlet_pressure": tk.StringVar(),
@@ -687,35 +675,8 @@ class PassageApp(tk.Tk):
         self._build_workspace_tables(right)
 
     def _build_sweep_tab(self) -> None:
-        sweep_canvas = tk.Canvas(
-            self.sweep_tab,
-            highlightthickness=0,
-            bg=WINDOW_BG,
-        )
-        sweep_scroll = ttk.Scrollbar(
-            self.sweep_tab,
-            orient=tk.VERTICAL,
-            command=sweep_canvas.yview,
-        )
-        sweep_canvas.configure(yscrollcommand=sweep_scroll.set)
-        sweep_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        sweep_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        content = ttk.Frame(sweep_canvas, padding=4)
-        content_window = sweep_canvas.create_window((0, 0), window=content, anchor=tk.NW)
-
-        def resize_scroll_region(_event: tk.Event) -> None:
-            sweep_canvas.configure(scrollregion=sweep_canvas.bbox(tk.ALL))
-
-        def resize_content_width(event: tk.Event) -> None:
-            sweep_canvas.itemconfigure(content_window, width=event.width)
-
-        content.bind("<Configure>", resize_scroll_region)
-        sweep_canvas.bind("<Configure>", resize_content_width)
-        self._sweep_scroll_canvas = sweep_canvas
-        self.bind_all("<MouseWheel>", self._on_sweep_mousewheel, add="+")
-
-        top = ttk.PanedWindow(content, orient=tk.HORIZONTAL)
-        top.pack(fill=tk.BOTH, expand=True)
+        top = ttk.PanedWindow(self.sweep_tab, orient=tk.HORIZONTAL)
+        top.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         controls = ttk.Frame(top)
         results = ttk.Frame(top)
         top.add(controls, weight=2)
@@ -835,7 +796,7 @@ class PassageApp(tk.Tk):
         ).pack(anchor=tk.W, pady=(0, 8))
         ttk.Label(
             variable_panel,
-            text="Check numeric inputs in Workspace. Up to 3 variables can be swept.",
+            text="Check numeric inputs in Workspace. Total case count is shown below.",
             style="Header.TLabel",
         ).pack(anchor=tk.W, pady=(0, 6))
         variable_columns = ("label", "current", "start", "end", "step", "unit")
@@ -1133,18 +1094,10 @@ class PassageApp(tk.Tk):
         )
         node_kind_combo.grid(row=2, column=1, sticky=tk.EW, pady=3)
         self._bind_combobox_mousewheel(node_kind_combo)
-        self._labeled_combo(
-            node_panel,
-            3,
-            "Tag",
-            self._node_vars["tag"],
-            TAG_OPTIONS,
-            form="node",
-        )
         self.node_inlet_fields = []
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
-            4,
+            3,
             "Inlet m_dot",
             self._node_vars["inlet_mdot"],
             form="node",
@@ -1153,7 +1106,7 @@ class PassageApp(tk.Tk):
         ))
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
-            5,
+            4,
             "Inlet temperature",
             self._node_vars["inlet_temperature"],
             form="node",
@@ -1162,7 +1115,7 @@ class PassageApp(tk.Tk):
         ))
         self.node_inlet_fields.append(self._labeled_entry(
             node_panel,
-            6,
+            5,
             "Inlet pressure",
             self._node_vars["inlet_pressure"],
             form="node",
@@ -1172,7 +1125,7 @@ class PassageApp(tk.Tk):
         node_panel.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(node_panel, style="Panel.TFrame")
-        buttons.grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+        buttons.grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
         ttk.Button(buttons, text="Add Node", command=self.add_node).pack(
             side=tk.LEFT
         )
@@ -1222,6 +1175,7 @@ class PassageApp(tk.Tk):
             self._edge_vars["tag"],
             TAG_OPTIONS,
             form="edge",
+            batch_key="tag",
         )
         row += 1
         self._labeled_combo(
@@ -1230,9 +1184,19 @@ class PassageApp(tk.Tk):
             "Technology",
             self._edge_vars["cooling_technology"],
             TECHNOLOGIES,
+            form="edge",
+            batch_key="cooling_technology",
         )
         row += 1
-        self._labeled_combo(edge_panel, row, "Shape", self._edge_vars["shape"], SHAPES)
+        self._labeled_combo(
+            edge_panel,
+            row,
+            "Shape",
+            self._edge_vars["shape"],
+            SHAPES,
+            form="edge",
+            batch_key="shape",
+        )
         row += 1
         self.edge_geometry_fields = {}
         for label, key in (
@@ -1249,9 +1213,18 @@ class PassageApp(tk.Tk):
                 form="edge",
                 unit_key=key,
                 sweep_key=key,
+                batch_key=key,
             )
             row += 1
-        self._labeled_combo(edge_panel, row, "Wall mode", self._edge_vars["wall_mode"], WALL_MODES)
+        self._labeled_combo(
+            edge_panel,
+            row,
+            "Wall mode",
+            self._edge_vars["wall_mode"],
+            WALL_MODES,
+            form="edge",
+            batch_key="wall_mode",
+        )
         row += 1
         self.edge_wall_fields = {}
         for label, key in (
@@ -1272,6 +1245,7 @@ class PassageApp(tk.Tk):
                 form="edge",
                 unit_key=key,
                 sweep_key=key,
+                batch_key=key,
             )
             row += 1
 
@@ -1345,18 +1319,28 @@ class PassageApp(tk.Tk):
             TAG_OPTIONS,
         )
         self.batch_target_tag_widgets = batch_panel.grid_slaves(row=4)
-        self._labeled_combo(
+        ttk.Label(
             batch_panel,
-            5,
-            "Field",
-            self.batch_field,
-            BATCH_FIELD_OPTIONS,
+            text="Checked fields",
+            style="Header.TLabel",
+        ).grid(row=5, column=0, sticky=tk.NW, pady=(8, 3))
+        self.batch_field_tree = ttk.Treeview(
+            batch_panel,
+            columns=("field",),
+            show="headings",
+            height=4,
         )
-        self.batch_value_widgets: list[tk.Widget] = []
-        self.batch_value_row = 6
-        self._render_batch_value_widgets()
+        self.batch_field_tree.heading("field", text="Variable")
+        self.batch_field_tree.column("field", width=260, anchor=tk.W)
+        self.batch_field_tree.grid(
+            row=5,
+            column=1,
+            columnspan=2,
+            sticky=tk.EW,
+            pady=(8, 3),
+        )
         buttons = ttk.Frame(batch_panel, style="Panel.TFrame")
-        buttons.grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
+        buttons.grid(row=6, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
         ttk.Button(
             buttons,
             text="Apply Batch",
@@ -1374,7 +1358,7 @@ class PassageApp(tk.Tk):
             style="Header.TLabel",
         )
         self.batch_status_label.grid(
-            row=8,
+            row=7,
             column=0,
             columnspan=3,
             sticky=tk.W,
@@ -1393,11 +1377,8 @@ class PassageApp(tk.Tk):
             "write",
             lambda *_args: self._update_batch_status(),
         )
-        self.batch_field.trace_add(
-            "write",
-            lambda *_args: self._render_batch_value_widgets(),
-        )
         self._update_batch_target_visibility()
+        self._refresh_batch_field_tree()
 
     def _build_selected_result_panel(self, parent: ttk.Frame) -> None:
         result_panel = self._panel(parent)
@@ -1445,7 +1426,7 @@ class PassageApp(tk.Tk):
             anchor=tk.W,
             pady=(0, 4),
         )
-        node_columns = ("node_id", "kind", "tag", "mdot", "temperature", "pressure")
+        node_columns = ("node_id", "kind", "mdot", "temperature", "pressure")
         self.node_tree = ttk.Treeview(
             table_panel,
             columns=node_columns,
@@ -1455,7 +1436,6 @@ class PassageApp(tk.Tk):
         node_headings = {
             "node_id": "Node",
             "kind": "Kind",
-            "tag": "Tag",
             "mdot": "m_dot [kg/s]",
             "temperature": "T [K]",
             "pressure": "P [Pa]",
@@ -1890,6 +1870,7 @@ class PassageApp(tk.Tk):
         self._draw_layout_background(canvas, width, height)
         self._draw_layout_edges(canvas)
         self._draw_layout_nodes(canvas)
+        self._draw_overlay_legend(canvas, width, height)
         self._draw_stale_banner(canvas)
 
     def _draw_layout_background(
@@ -1980,6 +1961,7 @@ class PassageApp(tk.Tk):
     def _draw_layout_edges(self, canvas: tk.Canvas) -> None:
         metric = self.overlay_metric.get() if hasattr(self, "overlay_metric") else "Technology"
         metric_values = self._overlay_edge_values(metric)
+        self._edge_label_bboxes = {}
         for row in self.edge_rows:
             from_pos = self.node_positions.get(row["from_node"])
             to_pos = self.node_positions.get(row["to_node"])
@@ -1995,6 +1977,17 @@ class PassageApp(tk.Tk):
             if overlay_value is not None:
                 color = _value_to_color(overlay_value, list(metric_values.values()))
             selected_color = WARNING_COLOR if is_current else SAFE_COLOR
+            if is_selected:
+                canvas.create_line(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    fill="#111827",
+                    width=11,
+                    arrow=tk.LAST,
+                    arrowshape=(18, 20, 8),
+                )
             canvas.create_line(
                 x1,
                 y1,
@@ -2014,13 +2007,18 @@ class PassageApp(tk.Tk):
                 label_fill = selected_color if is_selected else color
                 label_text = _contrast_text_color(label_fill)
             label_half_width = max(34, 4.4 * len(label) + 8)
-            canvas.create_rectangle(
+            label_bbox = (
                 mid_x - label_half_width,
                 mid_y - 13,
                 mid_x + label_half_width,
                 mid_y + 13,
+            )
+            self._edge_label_bboxes[row["edge_id"]] = label_bbox
+            canvas.create_rectangle(
+                *label_bbox,
                 fill="#fff8e8" if is_selected and overlay_value is None else label_fill,
                 outline=selected_color if is_selected else BORDER_COLOR,
+                width=3 if is_selected else 1,
             )
             canvas.create_text(
                 mid_x,
@@ -2029,6 +2027,86 @@ class PassageApp(tk.Tk):
                 fill=TEXT_COLOR if is_selected and overlay_value is None else label_text,
                 font=("Segoe UI", 9, "bold"),
             )
+
+    def _draw_overlay_legend(
+        self,
+        canvas: tk.Canvas,
+        width: int,
+        height: int,
+    ) -> None:
+        metric = self.overlay_metric.get() if hasattr(self, "overlay_metric") else "Technology"
+        if metric == "Technology":
+            return
+        values = self._overlay_edge_values(metric)
+        if not values:
+            values = self._overlay_node_values(metric)
+        if not values:
+            return
+        numeric_values = list(values.values())
+        low = min(numeric_values)
+        high = max(numeric_values)
+        legend_width = 170
+        legend_height = 150
+        x0 = max(width - legend_width - 18, 18)
+        y0 = max(height - legend_height - 18, 18)
+        canvas.create_rectangle(
+            x0,
+            y0,
+            x0 + legend_width,
+            y0 + legend_height,
+            fill="#ffffff",
+            outline=BORDER_COLOR,
+        )
+        canvas.create_text(
+            x0 + 10,
+            y0 + 12,
+            text=metric,
+            anchor=tk.W,
+            fill=TEXT_COLOR,
+            font=("Segoe UI", 9, "bold"),
+        )
+        bar_x0 = x0 + 14
+        bar_y0 = y0 + 34
+        bar_width = 20
+        bar_height = 86
+        steps = 18
+        for step in range(steps):
+            fraction_high_to_low = step / max(steps - 1, 1)
+            fraction = 1.0 - fraction_high_to_low
+            color = _interpolate_color("#2f80ed", "#d7191c", fraction)
+            y_start = bar_y0 + step * bar_height / steps
+            y_end = bar_y0 + (step + 1) * bar_height / steps
+            canvas.create_rectangle(
+                bar_x0,
+                y_start,
+                bar_x0 + bar_width,
+                y_end,
+                fill=color,
+                outline=color,
+            )
+        canvas.create_rectangle(
+            bar_x0,
+            bar_y0,
+            bar_x0 + bar_width,
+            bar_y0 + bar_height,
+            outline="#6b7280",
+        )
+        canvas.create_text(
+            bar_x0 + bar_width + 10,
+            bar_y0,
+            text=f"High {high:,.3g}",
+            anchor=tk.W,
+            fill=TEXT_COLOR,
+            font=("Segoe UI", 9),
+        )
+        canvas.create_text(
+            bar_x0 + bar_width + 10,
+            bar_y0 + bar_height,
+            text=f"Low {low:,.3g}",
+            anchor=tk.W,
+            fill=TEXT_COLOR,
+            font=("Segoe UI", 9),
+        )
 
     def _draw_layout_nodes(self, canvas: tk.Canvas) -> None:
         metric = self.overlay_metric.get() if hasattr(self, "overlay_metric") else "Technology"
@@ -2244,6 +2322,9 @@ class PassageApp(tk.Tk):
         return nearest_node
 
     def _edge_at_canvas(self, x_pos: float, y_pos: float) -> str | None:
+        for edge_id, (x0, y0, x1, y1) in self._edge_label_bboxes.items():
+            if x0 <= x_pos <= x1 and y0 <= y_pos <= y1:
+                return edge_id
         nearest_edge: str | None = None
         nearest_distance = 1e9
         for row in self.edge_rows:
@@ -2254,7 +2335,7 @@ class PassageApp(tk.Tk):
             x1, y1 = self._layout_to_canvas(from_pos)
             x2, y2 = self._layout_to_canvas(to_pos)
             distance = _point_to_segment_distance(x_pos, y_pos, x1, y1, x2, y2)
-            if distance <= 9 and distance < nearest_distance:
+            if distance <= 18 and distance < nearest_distance:
                 nearest_edge = row["edge_id"]
                 nearest_distance = distance
         return nearest_edge
@@ -2309,7 +2390,6 @@ class PassageApp(tk.Tk):
             {
                 "node_id": node_id,
                 "kind": "internal",
-                "tag": TAG_OPTIONS[0],
                 "inlet_mdot": "",
                 "inlet_temperature": "",
                 "inlet_pressure": "",
@@ -2927,12 +3007,13 @@ class PassageApp(tk.Tk):
         form: str | None = None,
         unit_key: str | None = None,
         sweep_key: str | None = None,
+        batch_key: str | None = None,
     ) -> tuple[ttk.Label, tk.Widget]:
         label_widget = ttk.Label(parent, text=label)
         label_widget.grid(row=row, column=0, sticky=tk.W, pady=3)
         unit_group = _unit_group_for_key(unit_key)
         if unit_group is None:
-            if sweep_key is None:
+            if sweep_key is None and batch_key is None:
                 entry = ttk.Entry(parent, textvariable=variable)
                 entry.grid(row=row, column=1, sticky=tk.EW, pady=3)
                 self._bind_entry_commit(entry, form)
@@ -2943,7 +3024,12 @@ class PassageApp(tk.Tk):
             entry = ttk.Entry(value_frame, textvariable=variable)
             entry.grid(row=0, column=0, sticky=tk.EW)
             self._bind_entry_commit(entry, form)
-            self._create_sweep_checkbutton(value_frame, 1, form, sweep_key)
+            column = 1
+            if sweep_key is not None:
+                self._create_sweep_checkbutton(value_frame, column, form, sweep_key)
+                column += 1
+            if batch_key is not None:
+                self._create_batch_checkbutton(value_frame, column, form, batch_key)
             return label_widget, value_frame
 
         value_frame = ttk.Frame(parent)
@@ -2965,8 +3051,12 @@ class PassageApp(tk.Tk):
             "<<ComboboxSelected>>",
             lambda _event, key=unit_key, form=form: self._on_unit_change(key, form),
         )
+        column = 2
         if sweep_key is not None:
-            self._create_sweep_checkbutton(value_frame, 2, form, sweep_key)
+            self._create_sweep_checkbutton(value_frame, column, form, sweep_key)
+            column += 1
+        if batch_key is not None:
+            self._create_batch_checkbutton(value_frame, column, form, batch_key)
         return label_widget, value_frame
 
     def _labeled_combo(
@@ -2977,18 +3067,36 @@ class PassageApp(tk.Tk):
         variable: tk.StringVar,
         values: tuple[str, ...],
         form: str | None = None,
-    ) -> tuple[ttk.Label, ttk.Combobox]:
+        batch_key: str | None = None,
+    ) -> tuple[ttk.Label, tk.Widget]:
         label_widget = ttk.Label(parent, text=label)
         label_widget.grid(row=row, column=0, sticky=tk.W, pady=3)
+        if batch_key is not None:
+            value_parent = ttk.Frame(parent)
+            value_parent.grid(row=row, column=1, sticky=tk.EW, pady=3)
+            value_parent.columnconfigure(0, weight=1)
+            combo_parent: tk.Widget = value_parent
+            combo_column = 0
+        else:
+            value_parent = None
+            combo_parent = parent
+            combo_column = 1
         combo = ttk.Combobox(
-            parent,
+            combo_parent,
             textvariable=variable,
             values=values,
             state="readonly",
             width=20,
         )
-        combo.grid(row=row, column=1, sticky=tk.EW, pady=3)
+        combo.grid(
+            row=0 if value_parent is not None else row,
+            column=combo_column,
+            sticky=tk.EW,
+            pady=0 if value_parent is not None else 3,
+        )
         self._bind_combobox_mousewheel(combo)
+        if batch_key is not None and value_parent is not None:
+            self._create_batch_checkbutton(value_parent, 1, form, batch_key)
         if form is not None:
             combo.bind(
                 "<FocusIn>",
@@ -3009,7 +3117,7 @@ class PassageApp(tk.Tk):
                 lambda _event, form=form: self._commit_form_edit(form),
                 add="+",
             )
-        return label_widget, combo
+        return label_widget, value_parent if value_parent is not None else combo
 
     def _sweep_combo(
         self,
@@ -3078,61 +3186,49 @@ class PassageApp(tk.Tk):
             command=lambda form=form, key=field_key: self._toggle_sweep_variable(form, key),
         ).grid(row=0, column=column, sticky=tk.E, padx=(8, 0))
 
-    def _render_batch_value_widgets(self) -> None:
-        if not hasattr(self, "batch_value_row"):
+    def _create_batch_checkbutton(
+        self,
+        parent: ttk.Frame,
+        column: int,
+        form: str | None,
+        field_key: str,
+    ) -> None:
+        if form != "edge":
             return
-        for widget in getattr(self, "batch_value_widgets", []):
-            widget.destroy()
-        self.batch_value_widgets = []
-        field_key, field_kind, field_choices = self._batch_field_spec()
-        label = ttk.Label(self._batch_panel_parent(), text="Value")
-        label.grid(row=self.batch_value_row, column=0, sticky=tk.W, pady=3)
-        self.batch_value_widgets.append(label)
-        if field_kind == "choice":
-            if not self.batch_choice_value.get() or self.batch_choice_value.get() not in field_choices:
-                self.batch_choice_value.set(field_choices[0] if field_choices else "")
-            combo = ttk.Combobox(
-                self._batch_panel_parent(),
-                textvariable=self.batch_choice_value,
-                values=field_choices,
-                state="readonly",
-                width=20,
-            )
-            combo.grid(row=self.batch_value_row, column=1, sticky=tk.EW, pady=3)
-            self._bind_combobox_mousewheel(combo)
-            self.batch_value_widgets.append(combo)
+        variable = self._batch_checkbox_vars.setdefault(field_key, tk.BooleanVar())
+        ttk.Checkbutton(
+            parent,
+            text="Batch",
+            variable=variable,
+            command=lambda key=field_key: self._toggle_batch_field(key),
+        ).grid(row=0, column=column, sticky=tk.E, padx=(8, 0))
+
+    def _toggle_batch_field(self, field_key: str) -> None:
+        variable = self._batch_checkbox_vars.get(field_key)
+        checked = bool(variable.get()) if variable is not None else False
+        if checked:
+            self.batch_field_keys.add(field_key)
         else:
-            value_frame = ttk.Frame(self._batch_panel_parent())
-            value_frame.grid(row=self.batch_value_row, column=1, sticky=tk.EW, pady=3)
-            value_frame.columnconfigure(0, weight=1)
-            entry = ttk.Entry(value_frame, textvariable=self.batch_value)
-            entry.grid(row=0, column=0, sticky=tk.EW)
-            unit_group = _unit_group_for_key(field_key)
-            if unit_group is not None:
-                if self.batch_unit.get() not in UNIT_OPTIONS[unit_group]:
-                    self.batch_unit.set(UNIT_OPTIONS[unit_group][0])
-                unit_combo = ttk.Combobox(
-                    value_frame,
-                    textvariable=self.batch_unit,
-                    values=UNIT_OPTIONS[unit_group],
-                    state="readonly",
-                    width=13,
-                )
-                unit_combo.grid(row=0, column=1, sticky=tk.E, padx=(6, 0))
-                self._bind_combobox_mousewheel(unit_combo)
-            else:
-                self.batch_unit.set("")
-            self.batch_value_widgets.append(value_frame)
+            self.batch_field_keys.discard(field_key)
+        self._sync_batch_checkboxes()
+        self._refresh_batch_field_tree()
         self._update_batch_status()
 
-    def _batch_panel_parent(self) -> tk.Widget:
-        return self.batch_panel if hasattr(self, "batch_panel") else self
+    def _sync_batch_checkboxes(self) -> None:
+        for field_key, variable in self._batch_checkbox_vars.items():
+            variable.set(field_key in self.batch_field_keys)
 
-    def _batch_field_spec(self) -> tuple[str, str, tuple[str, ...]]:
-        return BATCH_FIELD_BY_LABEL.get(
-            self.batch_field.get(),
-            BATCH_FIELD_BY_LABEL[BATCH_FIELD_OPTIONS[0]],
-        )
+    def _refresh_batch_field_tree(self) -> None:
+        if not hasattr(self, "batch_field_tree"):
+            return
+        self.batch_field_tree.delete(*self.batch_field_tree.get_children())
+        for field_key in sorted(self.batch_field_keys, key=_batch_sort_key):
+            self.batch_field_tree.insert(
+                "",
+                tk.END,
+                iid=field_key,
+                values=(_field_label(field_key),),
+            )
 
     def _update_batch_target_visibility(self) -> None:
         if not hasattr(self, "batch_target_technology_widgets"):
@@ -3158,6 +3254,7 @@ class PassageApp(tk.Tk):
             text=(
                 f"Target edges: {len(edge_ids)}"
                 f" | Ctrl-selected: {len(self.selected_layout_edge_ids)}"
+                f" | Batch fields: {len(self.batch_field_keys)}"
             )
         )
 
@@ -3189,15 +3286,20 @@ class PassageApp(tk.Tk):
         return [row["edge_id"] for row in self.edge_rows]
 
     def apply_batch_edit(self) -> None:
+        self._commit_focused_form()
+        source_row = self._selected_edge_row()
+        if source_row is None:
+            messagebox.showwarning("No source edge", "Select the edge that contains the values to copy.")
+            return
+        if not self.batch_field_keys:
+            messagebox.showwarning(
+                "No batch fields",
+                "Check Batch beside at least one edge input variable.",
+            )
+            return
         edge_ids = set(self._batch_target_edge_ids())
         if not edge_ids:
             messagebox.showwarning("No target edges", "No edges match the selected batch target.")
-            return
-        field_key, field_kind, _field_choices = self._batch_field_spec()
-        try:
-            value = self._batch_value_for_rows(field_key, field_kind)
-        except ValueError as exc:
-            messagebox.showerror("Invalid batch value", str(exc))
             return
 
         self._last_batch_snapshot = (deepcopy(self.node_rows), deepcopy(self.edge_rows))
@@ -3205,50 +3307,98 @@ class PassageApp(tk.Tk):
         for row in self.edge_rows:
             if row["edge_id"] not in edge_ids:
                 continue
-            self._apply_batch_value_to_row(row, field_key, field_kind, value)
+            try:
+                for field_key in sorted(self.batch_field_keys, key=_batch_sort_key):
+                    self._copy_batch_field(source_row, row, field_key)
+            except ValueError as exc:
+                messagebox.showerror("Invalid source value", str(exc))
+                self.node_rows, self.edge_rows = deepcopy(self._last_batch_snapshot)
+                return
             changed += 1
         self._refresh_after_batch_edit()
-        self.batch_status_label.configure(text=f"Applied to {changed} edge(s).")
+        self.batch_status_label.configure(
+            text=f"Applied {len(self.batch_field_keys)} field(s) to {changed} edge(s)."
+        )
 
-    def _batch_value_for_rows(self, field_key: str, field_kind: str) -> Any:
-        if field_kind == "choice":
-            value = self.batch_choice_value.get().strip()
-            if not value:
-                raise ValueError("Select a value to apply.")
-            return value
-        raw_value = self.batch_value.get().strip()
-        if not raw_value:
-            raise ValueError("Enter a value to apply.")
-        parsed = _required_float(raw_value, BATCH_FIELD_LABELS.get(field_key, field_key))
-        unit_group = _unit_group_for_key(field_key)
-        if unit_group is None:
-            return parsed
-        unit = self.batch_unit.get()
-        return _to_si(parsed, unit_group, unit)
+    def _selected_edge_row(self) -> dict[str, str] | None:
+        if self.selected_edge_id:
+            return next(
+                (row for row in self.edge_rows if row["edge_id"] == self.selected_edge_id),
+                None,
+            )
+        index = self._selected_index(self.edge_tree) if hasattr(self, "edge_tree") else None
+        if index is None or index >= len(self.edge_rows):
+            return None
+        return self.edge_rows[index]
 
-    def _apply_batch_value_to_row(
+    def _copy_batch_field(
         self,
+        source_row: dict[str, str],
         row: dict[str, str],
         field_key: str,
-        field_kind: str,
-        value: Any,
     ) -> None:
         if field_key in ALL_PARAM_KEYS:
             row_key = _param_row_key(field_key)
         else:
             row_key = field_key
-        if field_kind == "choice":
-            row[row_key] = str(value)
+        if field_key in {"tag", "cooling_technology", "shape", "wall_mode"}:
+            row[row_key] = source_row.get(row_key, "")
             if field_key == "cooling_technology":
                 row["cooling_technology"] = _normalize_technology(row["cooling_technology"])
                 self._apply_batch_param_defaults(row)
+                self._sanitize_row_shape(row)
+            if field_key == "shape":
+                self._sanitize_row_shape(row)
+            if field_key == "wall_mode":
+                self._sanitize_row_wall(row)
+            return
+        source_value = source_row.get(row_key, "").strip()
+        if not source_value:
+            row[row_key] = ""
             return
         unit_group = _unit_group_for_key(field_key)
         if unit_group is None:
-            row[row_key] = _fmt_optional(value)
+            row[row_key] = source_value
             return
-        row_unit = row.get(_unit_row_key(field_key), _default_unit_for_key(field_key))
-        row[row_key] = _fmt_optional(_from_si(float(value), unit_group, row_unit))
+        source_unit = source_row.get(
+            _unit_row_key(field_key),
+            _default_unit_for_key(field_key),
+        )
+        row_unit = row.get(
+            _unit_row_key(field_key),
+            _default_unit_for_key(field_key),
+        )
+        si_value = _to_si(
+            _required_float(source_value, _field_label(field_key)),
+            unit_group,
+            source_unit,
+        )
+        row[row_key] = _fmt_optional(_from_si(si_value, unit_group, row_unit))
+
+    def _sanitize_row_shape(self, row: dict[str, str]) -> None:
+        if row.get("cooling_technology") == "turning":
+            row["shape"] = "rectangular"
+            row["width"] = ""
+            row["height"] = ""
+            row["diameter"] = ""
+        elif row.get("shape") == "rectangular":
+            row["diameter"] = ""
+        elif row.get("shape") == "circular":
+            row["width"] = ""
+            row["height"] = ""
+
+    def _sanitize_row_wall(self, row: dict[str, str]) -> None:
+        if row.get("wall_mode") != "wall_temperature":
+            row["wall_temperature"] = ""
+        if row.get("wall_mode") != "heat_flux":
+            row["heat_flux"] = ""
+        if row.get("wall_mode") != "external_convection":
+            row["external_temperature"] = ""
+            row["external_htc"] = ""
+            row["wall_thickness"] = ""
+            row["wall_conductivity"] = ""
+            row["tbc_thickness"] = ""
+            row["tbc_conductivity"] = ""
 
     def _apply_batch_param_defaults(self, row: dict[str, str]) -> None:
         technology = _normalize_technology(row["cooling_technology"])
@@ -3263,6 +3413,8 @@ class PassageApp(tk.Tk):
         self._refresh_node_combos()
         self._update_dashboard_summary()
         self._sync_sweep_checkboxes()
+        self._sync_batch_checkboxes()
+        self._refresh_batch_field_tree()
         self._refresh_sweep_variable_tree()
         if self.selected_edge_id:
             index = self._edge_index(self.selected_edge_id)
@@ -3436,17 +3588,6 @@ class PassageApp(tk.Tk):
             return
 
         if checked:
-            if (
-                target.target_id not in self.sweep_variables
-                and len(self.sweep_variables) >= SWEEP_MAX_VARIABLES
-            ):
-                if checkbox is not None:
-                    checkbox.set(False)
-                messagebox.showerror(
-                    "Too many sweep variables",
-                    f"Select up to {SWEEP_MAX_VARIABLES} sweep variables in this version.",
-                )
-                return
             existing = self.sweep_variables.get(target.target_id)
             if existing is not None:
                 target.start = existing.start
@@ -3710,6 +3851,7 @@ class PassageApp(tk.Tk):
                 entry.grid(row=0, column=0, sticky=tk.EW)
                 self._bind_entry_commit(entry, "edge")
                 self._create_sweep_checkbutton(value_frame, 1, "edge", spec.key)
+                self._create_batch_checkbutton(value_frame, 2, "edge", spec.key)
                 continue
 
             value_frame = ttk.Frame(self.tech_param_frame)
@@ -3730,13 +3872,16 @@ class PassageApp(tk.Tk):
                 width=13,
             )
             unit_combo.grid(row=0, column=1, sticky=tk.E, padx=(6, 0))
+            self._bind_combobox_mousewheel(unit_combo)
             unit_combo.bind(
                 "<<ComboboxSelected>>",
                 lambda _event, key=spec.key: self._on_unit_change(key, "edge"),
             )
             self._create_sweep_checkbutton(value_frame, 2, "edge", spec.key)
+            self._create_batch_checkbutton(value_frame, 3, "edge", spec.key)
         self.tech_param_frame.columnconfigure(1, weight=1)
         self._sync_sweep_checkboxes()
+        self._sync_batch_checkboxes()
 
     def load_example(self) -> None:
         self._load_network(build_default_network())
@@ -3752,6 +3897,8 @@ class PassageApp(tk.Tk):
         self._update_dashboard_summary()
         self._select_first_rows()
         self._sync_sweep_checkboxes()
+        self._sync_batch_checkboxes()
+        self._refresh_batch_field_tree()
         self._refresh_sweep_variable_tree()
 
     def _select_first_rows(self) -> None:
@@ -3768,25 +3915,14 @@ class PassageApp(tk.Tk):
 
     def _refresh_node_tree(self) -> None:
         self.node_tree.delete(*self.node_tree.get_children())
-        columns = tuple(self.node_tree["columns"])
         for index, row in enumerate(self.node_rows):
-            if "tag" in columns:
-                values = (
-                    row["node_id"],
-                    row["kind"],
-                    row.get("tag", TAG_OPTIONS[0]),
-                    _fmt_row_si(row, "inlet_mdot"),
-                    _fmt_row_si(row, "inlet_temperature"),
-                    _fmt_row_si(row, "inlet_pressure"),
-                )
-            else:
-                values = (
-                    row["node_id"],
-                    row["kind"],
-                    _fmt_row_si(row, "inlet_mdot"),
-                    _fmt_row_si(row, "inlet_temperature"),
-                    _fmt_row_si(row, "inlet_pressure"),
-                )
+            values = (
+                row["node_id"],
+                row["kind"],
+                _fmt_row_si(row, "inlet_mdot"),
+                _fmt_row_si(row, "inlet_temperature"),
+                _fmt_row_si(row, "inlet_pressure"),
+            )
             self.node_tree.insert(
                 "",
                 tk.END,
@@ -4025,12 +4161,6 @@ class PassageApp(tk.Tk):
         self._apply_sweep_range_if_selected()
         if not self.sweep_variables:
             messagebox.showwarning("No sweep variables", "Select at least one sweep variable.")
-            return
-        if len(self.sweep_variables) > SWEEP_MAX_VARIABLES:
-            messagebox.showerror(
-                "Too many sweep variables",
-                f"Select up to {SWEEP_MAX_VARIABLES} sweep variables.",
-            )
             return
 
         try:
@@ -4546,7 +4676,7 @@ class PassageApp(tk.Tk):
         try:
             self._set_unit_vars_from_row(row, NODE_UNIT_KEYS)
             for key, variable in self._node_vars.items():
-                variable.set(row.get(key, TAG_OPTIONS[0] if key == "tag" else ""))
+                variable.set(row.get(key, ""))
         finally:
             self._suppress_auto_apply = False
         self._update_node_field_visibility()
@@ -4572,6 +4702,7 @@ class PassageApp(tk.Tk):
         self.params_text.delete("1.0", tk.END)
         self.params_text.insert("1.0", row["params_text"])
         self._sync_sweep_checkboxes()
+        self._sync_batch_checkboxes()
 
     def apply_node(self) -> None:
         index = self._selected_index(self.node_tree)
@@ -4614,7 +4745,6 @@ class PassageApp(tk.Tk):
             {
                 "node_id": node_id,
                 "kind": "internal",
-                "tag": TAG_OPTIONS[0],
                 "inlet_mdot": "",
                 "inlet_temperature": "",
                 "inlet_pressure": "",
@@ -5291,7 +5421,6 @@ def _node_to_row(node: NodeSpec) -> dict[str, str]:
     row = {
         "node_id": node.node_id,
         "kind": node.kind,
-        "tag": TAG_OPTIONS[0],
         "inlet_mdot": _fmt_optional(node.inlet_mdot) if is_inlet else "",
         "inlet_temperature": _fmt_optional(node.inlet_temperature) if is_inlet else "",
         "inlet_pressure": _fmt_optional(node.inlet_pressure) if is_inlet else "",
@@ -5413,10 +5542,7 @@ def _value_to_color(value: float, values: list[float]) -> str:
     else:
         fraction = (value - low) / (high - low)
     fraction = _clamp01(fraction)
-    if fraction < 0.5:
-        local = fraction / 0.5
-        return _interpolate_color("#2f80ed", "#f2c94c", local)
-    return _interpolate_color("#f2c94c", "#d7191c", (fraction - 0.5) / 0.5)
+    return _interpolate_color("#2f80ed", "#d7191c", fraction)
 
 
 def _interpolate_color(start: str, end: str, fraction: float) -> str:
@@ -5676,6 +5802,10 @@ def _fmt_sweep_value(value: Any) -> str:
 
 def _field_label(key: str) -> str:
     labels = {
+        "tag": "Tag",
+        "cooling_technology": "Technology",
+        "shape": "Shape",
+        "wall_mode": "Wall mode",
         "inlet_mdot": "Inlet m_dot",
         "inlet_temperature": "Inlet temperature",
         "inlet_pressure": "Inlet pressure",
@@ -5699,6 +5829,14 @@ def _field_label(key: str) -> str:
             if spec.key == key:
                 return spec.label
     return key
+
+
+def _batch_sort_key(field_key: str) -> tuple[int, str]:
+    order = {
+        key: index
+        for index, (key, _label, _kind, _choices) in enumerate(BATCH_FIELD_SPECS)
+    }
+    return order.get(field_key, 999), field_key
 
 
 def _sweep_display_values(start: str, end: str, step: str) -> list[float]:
