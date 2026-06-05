@@ -46,6 +46,12 @@ SHAPES = ("rectangular", "circular")
 WALL_MODES = ("adiabatic", "wall_temperature", "heat_flux", "external_convection")
 PROPERTY_MODELS = ("ideal_gas", "coolprop")
 TAG_OPTIONS = ("Unassigned", "Leading edge", "Trailing edge")
+BASE_WINDOW_WIDTH = 1380
+BASE_WINDOW_HEIGHT = 860
+BASE_MIN_WIDTH = 1260
+BASE_MIN_HEIGHT = 780
+MIN_UI_SCALE = 0.82
+UNDO_LIMIT = 10
 BATCH_TARGET_MODES = (
     "All edges",
     "Current edge",
@@ -153,6 +159,8 @@ BORDER_COLOR = "#d8e1ec"
 SAFE_COLOR = "#0f7b3d"
 WARNING_COLOR = "#b36b00"
 DANGER_COLOR = "#b00020"
+CURRENT_EDGE_COLOR = "#ffdd00"
+MULTI_EDGE_COLOR = "#00d084"
 DEFAULT_NODE_POSITIONS: dict[str, tuple[float, float]] = {
     "1-1": (0.82, 0.78),
     "1-2": (0.48, 0.86),
@@ -253,8 +261,8 @@ class PassageApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("1D Turbine Internal Passage Solver")
-        self.geometry("1380x860")
-        self.minsize(1260, 780)
+        self._ui_scale = 1.0
+        self._configure_window_size()
         self.configure(bg=WINDOW_BG)
 
         self.node_rows: list[dict[str, str]] = []
@@ -293,6 +301,9 @@ class PassageApp(tk.Tk):
         self.batch_field_keys: set[str] = set()
         self._batch_checkbox_vars: dict[str, tk.BooleanVar] = {}
         self._last_batch_snapshot: tuple[list[dict[str, str]], list[dict[str, str]]] | None = None
+        self._undo_stack: list[dict[str, Any]] = []
+        self._is_restoring_undo = False
+        self._drag_start_snapshot: dict[str, Any] | None = None
 
         self.property_model = tk.StringVar(value="ideal_gas")
         self.overlay_metric = tk.StringVar(value="Technology")
@@ -370,6 +381,7 @@ class PassageApp(tk.Tk):
 
         self._configure_style()
         self._build_widgets()
+        self._update_undo_controls()
         self._install_form_traces()
         self._edge_vars["cooling_technology"].trace_add(
             "write", self._on_technology_change
@@ -384,6 +396,168 @@ class PassageApp(tk.Tk):
         self._load_network(build_default_network())
         self.calculate(show_success=False)
 
+    def _configure_window_size(self) -> None:
+        screen_width = max(self.winfo_screenwidth(), 1)
+        screen_height = max(self.winfo_screenheight(), 1)
+        available_width = min(screen_width, max(640, screen_width - 80))
+        available_height = min(screen_height, max(520, screen_height - 100))
+        geometry_scale = min(
+            1.0,
+            available_width / BASE_WINDOW_WIDTH,
+            available_height / BASE_WINDOW_HEIGHT,
+        )
+        self._ui_scale = min(1.0, max(MIN_UI_SCALE, geometry_scale))
+        if self._ui_scale < 0.995:
+            try:
+                current_scaling = float(self.tk.call("tk", "scaling"))
+                self.tk.call("tk", "scaling", current_scaling * self._ui_scale)
+            except (tk.TclError, ValueError):
+                pass
+        window_width = min(BASE_WINDOW_WIDTH, available_width)
+        window_height = min(BASE_WINDOW_HEIGHT, available_height)
+        min_width = min(BASE_MIN_WIDTH, window_width, max(480, int(window_width * 0.85)))
+        min_height = min(BASE_MIN_HEIGHT, window_height, max(420, int(window_height * 0.85)))
+        self.geometry(f"{window_width}x{window_height}")
+        self.minsize(min_width, min_height)
+
+    def _scaled_int(self, value: int, minimum: int | None = None) -> int:
+        scaled = int(round(value * self._ui_scale))
+        if minimum is not None:
+            return max(minimum, scaled)
+        return scaled
+
+    def _scaled_font(
+        self,
+        size: int,
+        *styles: str,
+        min_size: int = 9,
+    ) -> tuple[Any, ...]:
+        return ("Segoe UI", self._scaled_int(size, min_size), *styles)
+
+    def _network_snapshot(self, label: str) -> dict[str, Any]:
+        return {
+            "label": label,
+            "node_rows": deepcopy(self.node_rows),
+            "edge_rows": deepcopy(self.edge_rows),
+            "node_positions": deepcopy(self.node_positions),
+            "selected_node_id": self.selected_node_id,
+            "selected_edge_id": self.selected_edge_id,
+            "selected_layout_edge_ids": set(self.selected_layout_edge_ids),
+        }
+
+    def _push_undo_snapshot(
+        self,
+        label: str,
+        snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        if self._is_restoring_undo:
+            return
+        self._undo_stack.append(snapshot or self._network_snapshot(label))
+        if len(self._undo_stack) > UNDO_LIMIT:
+            del self._undo_stack[0:len(self._undo_stack) - UNDO_LIMIT]
+        self._update_undo_controls()
+
+    def _update_undo_controls(self) -> None:
+        if not hasattr(self, "undo_button"):
+            return
+        count = len(self._undo_stack)
+        self.undo_button.configure(
+            text=f"Undo ({count})" if count else "Undo",
+            state=tk.NORMAL if count else tk.DISABLED,
+        )
+
+    def _on_undo_shortcut(self, _event: tk.Event) -> str:
+        self.undo_last_edit(show_empty=False)
+        return "break"
+
+    def undo_last_edit(self, show_empty: bool = True) -> None:
+        if not self._undo_stack:
+            if show_empty:
+                messagebox.showinfo("No undo", "There is no edit to undo.")
+            return
+        snapshot = self._undo_stack.pop()
+        self._restore_network_snapshot(snapshot)
+        self._update_undo_controls()
+        label = snapshot.get("label", "edit")
+        self._update_layout_status(f"Undone: {label}")
+
+    def _restore_network_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self._is_restoring_undo = True
+        previous_suppress = self._suppress_auto_apply
+        self._suppress_auto_apply = True
+        try:
+            self.node_rows = deepcopy(snapshot["node_rows"])
+            self.edge_rows = deepcopy(snapshot["edge_rows"])
+            self.node_positions = deepcopy(snapshot["node_positions"])
+            valid_node_ids = {row["node_id"] for row in self.node_rows}
+            valid_edge_ids = {row["edge_id"] for row in self.edge_rows}
+            self.selected_node_id = (
+                snapshot.get("selected_node_id")
+                if snapshot.get("selected_node_id") in valid_node_ids
+                else None
+            )
+            self.selected_edge_id = (
+                snapshot.get("selected_edge_id")
+                if snapshot.get("selected_edge_id") in valid_edge_ids
+                else None
+            )
+            self.selected_layout_edge_ids = {
+                edge_id
+                for edge_id in snapshot.get("selected_layout_edge_ids", set())
+                if edge_id in valid_edge_ids
+            }
+            self._ensure_node_positions()
+            self._refresh_node_tree()
+            self._refresh_edge_tree()
+            self._refresh_node_combos()
+            self._update_dashboard_summary()
+            self._sync_sweep_checkboxes()
+            self._sync_batch_checkboxes()
+            self._refresh_batch_field_tree()
+            self._refresh_sweep_variable_tree()
+            self._restore_tree_selection()
+        finally:
+            self._suppress_auto_apply = previous_suppress
+            self._is_restoring_undo = False
+        self._update_selected_result_panel()
+        self._update_batch_status()
+        self._redraw_layout_canvas()
+        self._after_apply()
+
+    def _restore_tree_selection(self) -> None:
+        if hasattr(self, "node_tree"):
+            self.node_tree.selection_remove(self.node_tree.selection())
+        if hasattr(self, "edge_tree"):
+            self.edge_tree.selection_remove(self.edge_tree.selection())
+        if self.selected_edge_id:
+            index = self._edge_index(self.selected_edge_id)
+            if index is not None:
+                self.selected_node_id = None
+                self.edge_tree.selection_set(str(index))
+                self.edge_tree.focus(str(index))
+                self._populate_edge_form(index)
+                return
+        if self.selected_node_id:
+            index = self._node_index(self.selected_node_id)
+            if index is not None:
+                self.selected_edge_id = None
+                self.node_tree.selection_set(str(index))
+                self.node_tree.focus(str(index))
+                self._populate_node_form(index)
+                return
+        if self.edge_rows:
+            self.selected_edge_id = self.edge_rows[0]["edge_id"]
+            self.selected_node_id = None
+            self.edge_tree.selection_set("0")
+            self.edge_tree.focus("0")
+            self._populate_edge_form(0)
+        elif self.node_rows:
+            self.selected_node_id = self.node_rows[0]["node_id"]
+            self.selected_edge_id = None
+            self.node_tree.selection_set("0")
+            self.node_tree.focus("0")
+            self._populate_node_form(0)
+
     def _configure_style(self) -> None:
         style = ttk.Style(self)
         try:
@@ -391,10 +565,10 @@ class PassageApp(tk.Tk):
         except tk.TclError:
             pass
 
-        default_font = ("Segoe UI", 11)
-        title_font = ("Segoe UI", 21, "bold")
-        heading_font = ("Segoe UI", 12, "bold")
-        small_heading_font = ("Segoe UI", 11, "bold")
+        default_font = self._scaled_font(11, min_size=9)
+        title_font = self._scaled_font(21, "bold", min_size=15)
+        heading_font = self._scaled_font(12, "bold", min_size=10)
+        small_heading_font = self._scaled_font(11, "bold", min_size=9)
 
         style.configure(".", font=default_font, background=WINDOW_BG, foreground=TEXT_COLOR)
         style.configure("TFrame", background=WINDOW_BG)
@@ -413,7 +587,7 @@ class PassageApp(tk.Tk):
             "Subtitle.TLabel",
             background=PANEL_BG,
             foreground=MUTED_COLOR,
-            font=("Segoe UI", 11),
+            font=default_font,
         )
         style.configure(
             "Section.TLabel",
@@ -437,8 +611,8 @@ class PassageApp(tk.Tk):
         style.configure("TNotebook", background=WINDOW_BG, borderwidth=0)
         style.configure(
             "TNotebook.Tab",
-            padding=(16, 9),
-            font=("Segoe UI", 11, "bold"),
+            padding=(self._scaled_int(16, 10), self._scaled_int(9, 6)),
+            font=small_heading_font,
         )
         style.map(
             "TNotebook.Tab",
@@ -449,29 +623,33 @@ class PassageApp(tk.Tk):
             "Accent.TButton",
             background=ACCENT_COLOR,
             foreground="#ffffff",
-            padding=(13, 8),
-            font=("Segoe UI", 11, "bold"),
+            padding=(self._scaled_int(13, 9), self._scaled_int(8, 5)),
+            font=small_heading_font,
         )
         style.map(
             "Accent.TButton",
             background=[("active", "#17629a"), ("pressed", "#14557f")],
             foreground=[("active", "#ffffff"), ("pressed", "#ffffff")],
         )
-        style.configure("TButton", padding=(11, 7), font=("Segoe UI", 11))
+        style.configure(
+            "TButton",
+            padding=(self._scaled_int(11, 8), self._scaled_int(7, 5)),
+            font=default_font,
+        )
         style.configure(
             "Treeview",
             background=PANEL_BG,
             fieldbackground=PANEL_BG,
             foreground=TEXT_COLOR,
-            rowheight=32,
+            rowheight=self._scaled_int(32, 26),
             borderwidth=0,
-            font=("Segoe UI", 11),
+            font=default_font,
         )
         style.configure(
             "Treeview.Heading",
             background="#edf3f8",
             foreground=TEXT_COLOR,
-            font=("Segoe UI", 11, "bold"),
+            font=small_heading_font,
         )
         style.map(
             "Treeview",
@@ -509,6 +687,13 @@ class PassageApp(tk.Tk):
         ttk.Button(toolbar, text="Load Example", command=self.load_example).pack(
             side=tk.LEFT
         )
+        self.undo_button = ttk.Button(
+            toolbar,
+            text="Undo",
+            command=self.undo_last_edit,
+            state=tk.DISABLED,
+        )
+        self.undo_button.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
             toolbar,
             text="Calculate",
@@ -555,6 +740,8 @@ class PassageApp(tk.Tk):
         self._build_correlations_tab()
         self._build_results_tab()
         self._build_warnings_tab()
+        self.bind_all("<Control-z>", self._on_undo_shortcut, add="+")
+        self.bind_all("<Control-Z>", self._on_undo_shortcut, add="+")
 
     def _build_workspace_tab(self) -> None:
         main = ttk.PanedWindow(self.workspace_tab, orient=tk.HORIZONTAL)
@@ -1841,9 +2028,11 @@ class PassageApp(tk.Tk):
         self._redraw_layout_canvas()
 
     def reset_layout_positions(self) -> None:
+        self._push_undo_snapshot("Reset node positions")
         self.node_positions.clear()
         self._ensure_node_positions()
         self._redraw_layout_canvas()
+        self._after_apply()
 
     def _ensure_node_positions(self) -> None:
         current_ids = [row["node_id"] for row in self.node_rows]
@@ -1871,6 +2060,7 @@ class PassageApp(tk.Tk):
         self._draw_layout_edges(canvas)
         self._draw_layout_nodes(canvas)
         self._draw_overlay_legend(canvas, width, height)
+        self._draw_selection_badge(canvas)
         self._draw_stale_banner(canvas)
 
     def _draw_layout_background(
@@ -1976,7 +2166,7 @@ class PassageApp(tk.Tk):
             color = ACCENT_COLOR
             if overlay_value is not None:
                 color = _value_to_color(overlay_value, list(metric_values.values()))
-            selected_color = WARNING_COLOR if is_current else SAFE_COLOR
+            selected_color = CURRENT_EDGE_COLOR if is_current else MULTI_EDGE_COLOR
             if is_selected:
                 canvas.create_line(
                     x1,
@@ -2027,6 +2217,31 @@ class PassageApp(tk.Tk):
                 fill=TEXT_COLOR if is_selected and overlay_value is None else label_text,
                 font=("Segoe UI", 9, "bold"),
             )
+
+    def _draw_selection_badge(self, canvas: tk.Canvas) -> None:
+        text = self._selection_status_text(compact=False)
+        if not text:
+            return
+        y0 = 64 if self.results_stale else 24
+        text_width = min(max(300, 7 * len(text)), 680)
+        canvas.create_rectangle(
+            24,
+            y0,
+            24 + text_width,
+            y0 + 36,
+            fill="#111827",
+            outline=CURRENT_EDGE_COLOR,
+            width=2,
+        )
+        canvas.create_text(
+            36,
+            y0 + 18,
+            text=text,
+            anchor=tk.W,
+            fill="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            width=text_width - 24,
+        )
 
     def _draw_overlay_legend(
         self,
@@ -2224,6 +2439,22 @@ class PassageApp(tk.Tk):
         if hasattr(self, "layout_status_label"):
             self.layout_status_label.configure(text=text)
 
+    def _selection_status_text(self, compact: bool = True) -> str:
+        if self.selected_layout_edge_ids:
+            edge_ids = sorted(self.selected_layout_edge_ids)
+            shown_ids = edge_ids[:5]
+            suffix = "" if len(edge_ids) <= len(shown_ids) else f", +{len(edge_ids) - len(shown_ids)}"
+            prefix = "Selected" if compact else "Ctrl-selected edges"
+            text = f"{prefix}: {', '.join(shown_ids)}{suffix}"
+            if self.selected_edge_id:
+                text += f" | Current: {self.selected_edge_id}"
+            return text
+        if self.selected_edge_id:
+            return f"Current edge: {self.selected_edge_id}"
+        if self.selected_node_id:
+            return f"Current node: {self.selected_node_id}"
+        return ""
+
     def _on_layout_press(self, event: tk.Event) -> None:
         mode = self._layout_mode.get()
         node_id = self._node_at_canvas(event.x, event.y)
@@ -2252,6 +2483,7 @@ class PassageApp(tk.Tk):
             self._select_node_by_id(node_id)
             self._drag_node_id = node_id
             self._drag_started = False
+            self._drag_start_snapshot = self._network_snapshot("Move node")
             return
 
         edge_id = self._edge_at_canvas(event.x, event.y)
@@ -2267,9 +2499,13 @@ class PassageApp(tk.Tk):
         self.selected_layout_edge_ids.clear()
         self._update_selected_result_panel()
         self._update_batch_status()
+        self._update_layout_status("Mode: Select / Move")
         self._redraw_layout_canvas()
 
     def _toggle_layout_edge_selection(self, edge_id: str) -> None:
+        previous_current = self.selected_edge_id
+        if previous_current and previous_current != edge_id:
+            self.selected_layout_edge_ids.add(previous_current)
         if edge_id in self.selected_layout_edge_ids:
             self.selected_layout_edge_ids.remove(edge_id)
         else:
@@ -2284,9 +2520,7 @@ class PassageApp(tk.Tk):
         if hasattr(self, "node_tree"):
             self.node_tree.selection_remove(self.node_tree.selection())
         self._update_selected_result_panel()
-        self._update_layout_status(
-            f"Ctrl-selected edges: {len(self.selected_layout_edge_ids)}"
-        )
+        self._update_layout_status(self._selection_status_text())
         self._update_batch_status()
         self._redraw_layout_canvas()
 
@@ -2302,9 +2536,13 @@ class PassageApp(tk.Tk):
 
     def _on_layout_release(self, _event: tk.Event) -> None:
         if self._drag_node_id is not None and self._drag_started:
+            if self._drag_start_snapshot is not None:
+                self._push_undo_snapshot("Move node", self._drag_start_snapshot)
             self._redraw_layout_canvas()
+            self._after_apply()
         self._drag_node_id = None
         self._drag_started = False
+        self._drag_start_snapshot = None
 
     def _node_at_canvas(self, x_pos: float, y_pos: float) -> str | None:
         nearest_node: str | None = None
@@ -2354,6 +2592,7 @@ class PassageApp(tk.Tk):
             self.edge_tree.selection_remove(self.edge_tree.selection())
         self._update_selected_result_panel()
         self._update_batch_status()
+        self._update_layout_status(self._selection_status_text())
         self._redraw_layout_canvas()
 
     def _select_edge_by_id(self, edge_id: str) -> None:
@@ -2370,6 +2609,7 @@ class PassageApp(tk.Tk):
             self.node_tree.selection_remove(self.node_tree.selection())
         self._update_selected_result_panel()
         self._update_batch_status()
+        self._update_layout_status(self._selection_status_text())
         self._redraw_layout_canvas()
 
     def _node_index(self, node_id: str) -> int | None:
@@ -2385,6 +2625,7 @@ class PassageApp(tk.Tk):
         return None
 
     def _add_node_at_position(self, position: tuple[float, float]) -> None:
+        self._push_undo_snapshot("Add node")
         node_id = self._next_id("N", {row["node_id"] for row in self.node_rows})
         self.node_rows.append(
             {
@@ -2402,8 +2643,10 @@ class PassageApp(tk.Tk):
         self._refresh_node_combos()
         self._update_dashboard_summary()
         self._select_node_by_id(node_id)
+        self._after_apply()
 
     def _create_edge_between(self, from_node: str, to_node: str) -> None:
+        self._push_undo_snapshot("Add edge")
         existing_ids = {row["edge_id"] for row in self.edge_rows}
         base_id = f"{from_node}_to_{to_node}".replace(" ", "_")
         edge_id = _unique_id(base_id, existing_ids)
@@ -2413,6 +2656,7 @@ class PassageApp(tk.Tk):
         self._refresh_edge_tree()
         self._update_dashboard_summary()
         self._select_edge_by_id(edge_id)
+        self._after_apply()
 
     def _convert_source_outlet_to_internal(self, node_id: str) -> None:
         for row in self.node_rows:
@@ -3302,7 +3546,12 @@ class PassageApp(tk.Tk):
             messagebox.showwarning("No target edges", "No edges match the selected batch target.")
             return
 
-        self._last_batch_snapshot = (deepcopy(self.node_rows), deepcopy(self.edge_rows))
+        batch_snapshot = self._network_snapshot("Batch apply")
+        self._push_undo_snapshot("Batch apply", batch_snapshot)
+        self._last_batch_snapshot = (
+            deepcopy(batch_snapshot["node_rows"]),
+            deepcopy(batch_snapshot["edge_rows"]),
+        )
         changed = 0
         for row in self.edge_rows:
             if row["edge_id"] not in edge_ids:
@@ -3313,6 +3562,9 @@ class PassageApp(tk.Tk):
             except ValueError as exc:
                 messagebox.showerror("Invalid source value", str(exc))
                 self.node_rows, self.edge_rows = deepcopy(self._last_batch_snapshot)
+                if self._undo_stack and self._undo_stack[-1] is batch_snapshot:
+                    self._undo_stack.pop()
+                    self._update_undo_controls()
                 return
             changed += 1
         self._refresh_after_batch_edit()
@@ -3759,6 +4011,9 @@ class PassageApp(tk.Tk):
             row["inlet_mdot"] = ""
             row["inlet_temperature"] = ""
             row["inlet_pressure"] = ""
+        if row == self.node_rows[index]:
+            return
+        self._push_undo_snapshot("Edit node")
         old_id = self.node_rows[index]["node_id"]
         self.node_rows[index] = row
         if row["node_id"] != old_id:
@@ -3780,6 +4035,9 @@ class PassageApp(tk.Tk):
         row = self._edge_form_to_row()
         if not row["edge_id"] or self._id_exists(row["edge_id"], self.edge_rows, index, "edge_id"):
             return
+        if row == self.edge_rows[index]:
+            return
+        self._push_undo_snapshot("Edit edge")
         self.edge_rows[index] = row
         self.selected_edge_id = row["edge_id"]
         self.selected_node_id = None
@@ -3884,6 +4142,8 @@ class PassageApp(tk.Tk):
         self._sync_batch_checkboxes()
 
     def load_example(self) -> None:
+        if self.node_rows or self.edge_rows:
+            self._push_undo_snapshot("Load example")
         self._load_network(build_default_network())
         self.calculate(show_success=False)
 
@@ -4655,6 +4915,7 @@ class PassageApp(tk.Tk):
             self._populate_node_form(index)
             self._update_selected_result_panel()
             self._update_batch_status()
+            self._update_layout_status(self._selection_status_text())
             self._redraw_layout_canvas()
 
     def _on_edge_select(self, _event: tk.Event) -> None:
@@ -4668,6 +4929,7 @@ class PassageApp(tk.Tk):
             self._populate_edge_form(index)
             self._update_selected_result_panel()
             self._update_batch_status()
+            self._update_layout_status(self._selection_status_text())
             self._redraw_layout_canvas()
 
     def _populate_node_form(self, index: int) -> None:
@@ -4722,6 +4984,9 @@ class PassageApp(tk.Tk):
             row["inlet_mdot"] = ""
             row["inlet_temperature"] = ""
             row["inlet_pressure"] = ""
+        if row == self.node_rows[index]:
+            return
+        self._push_undo_snapshot("Edit node")
         self.node_rows[index] = row
         if row["node_id"] != old_id:
             if old_id in self.node_positions:
@@ -4740,6 +5005,7 @@ class PassageApp(tk.Tk):
         self._after_apply()
 
     def add_node(self) -> None:
+        self._push_undo_snapshot("Add node")
         node_id = self._next_id("N", {row["node_id"] for row in self.node_rows})
         self.node_rows.append(
             {
@@ -4766,6 +5032,7 @@ class PassageApp(tk.Tk):
         if index is None:
             messagebox.showwarning("No selection", "Select a node first.")
             return
+        self._push_undo_snapshot("Delete node")
         node_id = self.node_rows[index]["node_id"]
         del self.node_rows[index]
         self.edge_rows = [
@@ -4800,6 +5067,9 @@ class PassageApp(tk.Tk):
         if self._id_exists(row["edge_id"], self.edge_rows, index, "edge_id"):
             messagebox.showerror("Invalid edge", "Edge ID must be unique.")
             return
+        if row == self.edge_rows[index]:
+            return
+        self._push_undo_snapshot("Edit edge")
         self.edge_rows[index] = row
         self.selected_edge_id = row["edge_id"]
         self.selected_node_id = None
@@ -4815,6 +5085,7 @@ class PassageApp(tk.Tk):
         if len(node_ids) < 2:
             messagebox.showerror("Need nodes", "Add at least two nodes first.")
             return
+        self._push_undo_snapshot("Add edge")
         from_node = self._edge_vars["from_node"].get().strip() or node_ids[0]
         to_node = self._edge_vars["to_node"].get().strip() or node_ids[1]
         if from_node not in node_ids or to_node not in node_ids or from_node == to_node:
@@ -4838,6 +5109,7 @@ class PassageApp(tk.Tk):
         if index is None:
             messagebox.showwarning("No selection", "Select an edge first.")
             return
+        self._push_undo_snapshot("Delete edge")
         del self.edge_rows[index]
         self.selected_edge_id = None
         valid_edge_ids = {edge["edge_id"] for edge in self.edge_rows}
