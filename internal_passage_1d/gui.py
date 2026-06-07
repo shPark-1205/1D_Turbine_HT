@@ -862,8 +862,35 @@ class PassageApp(tk.Tk):
         self._build_workspace_tables(right)
 
     def _build_sweep_tab(self) -> None:
-        top = ttk.PanedWindow(self.sweep_tab, orient=tk.HORIZONTAL)
-        top.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        sweep_canvas = tk.Canvas(
+            self.sweep_tab,
+            highlightthickness=0,
+            bg=WINDOW_BG,
+        )
+        sweep_scroll = ttk.Scrollbar(
+            self.sweep_tab,
+            orient=tk.VERTICAL,
+            command=sweep_canvas.yview,
+        )
+        sweep_canvas.configure(yscrollcommand=sweep_scroll.set)
+        sweep_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        sweep_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content = ttk.Frame(sweep_canvas, padding=(4, 4, 12, 4))
+        content_window = sweep_canvas.create_window((0, 0), window=content, anchor=tk.NW)
+
+        def resize_scroll_region(_event: tk.Event) -> None:
+            sweep_canvas.configure(scrollregion=sweep_canvas.bbox(tk.ALL))
+
+        def resize_content_width(event: tk.Event) -> None:
+            sweep_canvas.itemconfigure(content_window, width=event.width)
+
+        content.bind("<Configure>", resize_scroll_region)
+        sweep_canvas.bind("<Configure>", resize_content_width)
+        self._sweep_scroll_canvas = sweep_canvas
+        self.bind_all("<MouseWheel>", self._on_sweep_mousewheel, add="+")
+
+        top = ttk.PanedWindow(content, orient=tk.HORIZONTAL)
+        top.pack(fill=tk.BOTH, expand=True)
         controls = ttk.Frame(top)
         results = ttk.Frame(top)
         top.add(controls, weight=2)
