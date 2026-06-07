@@ -1138,7 +1138,21 @@ class PassageApp(tk.Tk):
         )
         self.sweep_status_label.pack(side=tk.RIGHT)
 
-        best_panel = self._panel(results)
+        results_pane = ttk.PanedWindow(results, orient=tk.VERTICAL)
+        results_pane.pack(fill=tk.BOTH, expand=True)
+        result_stack = ttk.Frame(results_pane)
+        plot_stack = ttk.Frame(results_pane)
+        results_pane.add(result_stack, weight=2)
+        results_pane.add(plot_stack, weight=3)
+        self.sweep_results_pane = results_pane
+        self._sweep_results_sash_initialized = False
+        results_pane.bind(
+            "<Configure>",
+            lambda _event: self._initialize_sweep_results_sash(),
+            add="+",
+        )
+
+        best_panel = self._panel(result_stack)
         best_panel.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(best_panel, text="Best Case", style="Section.TLabel").pack(
             anchor=tk.W,
@@ -1156,8 +1170,8 @@ class PassageApp(tk.Tk):
         self.sweep_best_tree.column("value", width=260, anchor=tk.W)
         self.sweep_best_tree.pack(fill=tk.X)
 
-        table_panel = self._panel(results)
-        table_panel.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        table_panel = self._panel(result_stack)
+        table_panel.pack(fill=tk.BOTH, expand=True)
         ttk.Label(table_panel, text="Sweep Results", style="Section.TLabel").pack(
             anchor=tk.W,
             pady=(0, 8),
@@ -1174,7 +1188,7 @@ class PassageApp(tk.Tk):
         self.sweep_result_tree.configure(yscrollcommand=result_scroll.set)
         result_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        plot_panel = self._panel(results)
+        plot_panel = self._panel(plot_stack)
         plot_panel.pack(fill=tk.BOTH, expand=True)
         plot_toolbar = ttk.Frame(plot_panel, style="Panel.TFrame")
         plot_toolbar.pack(fill=tk.X, pady=(0, 8))
@@ -1218,10 +1232,30 @@ class PassageApp(tk.Tk):
             command=self._update_sweep_plot,
         ).pack(side=tk.LEFT)
         self.sweep_plot_frame = ttk.Frame(plot_panel, style="Panel.TFrame")
+        self.sweep_plot_frame.configure(height=self._scaled_int(310, 240))
         self.sweep_plot_frame.pack(fill=tk.BOTH, expand=True)
         self._set_sweep_best_rows([("Status", "Run a sweep to view the best case.")])
         self._set_sweep_result_columns([])
         self._update_sweep_objective_controls()
+        self.after_idle(self._initialize_sweep_results_sash)
+
+    def _initialize_sweep_results_sash(self) -> None:
+        if not hasattr(self, "sweep_results_pane"):
+            return
+        if getattr(self, "_sweep_results_sash_initialized", False):
+            return
+        try:
+            pane_height = self.sweep_results_pane.winfo_height()
+            if pane_height < self._scaled_int(500, 380):
+                return
+            target = min(
+                max(self._scaled_int(260, 210), int(pane_height * 0.48)),
+                pane_height - self._scaled_int(270, 210),
+            )
+            self.sweep_results_pane.sashpos(0, target)
+            self._sweep_results_sash_initialized = True
+        except tk.TclError:
+            return
 
     def _build_workspace_summary(self, parent: ttk.Frame) -> None:
         summary_panel = self._panel(parent)
